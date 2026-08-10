@@ -1,0 +1,354 @@
+# chapterwise — Cursor project rules
+
+Textbook PDF → ordered topics (chapters/sections/subsections) + per-topic explanation, Q&A, images, and TTS narration.
+
+**Monorepo layout:** `backend/` is a standalone FastAPI app (`python backend/main.py`). `frontend/` is a standalone Vite React app (`npm run dev` from `frontend/`). Do not mix Python and JS across folders. **`frontend/src/config/api.js` is the only place the backend base URL/port should be hardcoded** (default `http://127.0.0.1:8766`).
+
+---
+
+## 1. What this app does (v1 goal)
+
+1. User uploads a textbook PDF.
+2. Backend extracts text + images per page (local PyMuPDF + pdfplumber, or optional **Kaggle** remote extract via tunnel).
+3. **Kaggle Llama** or Azure OpenAI builds an **ordered** hierarchical topic tree (chapter → section → subsection) in document order.
+4. Each topic shows explanation, source page range, and formula/diagram images from those pages.
+5. User asks questions grounded in that topic’s text only.
+6. User presses Listen for OpenAI TTS narration.
+
+**Different from magazine/Veda app:** topics are **hierarchical** and stay in **document order** (not layout/font driven). Images attach to topics by page range.
+
+---
+
+## 2. Build order (§8) — status
+
+| Step | Scope | Status |
+|------|--------|--------|
+| **1** | Backend `/upload_pdf` + `pdf_extract.py` (per-page text + images) | ✅ Done |
+| **2** | Backend `/build_topics` + `topic_builder.py` (ordered JSON tree via Kaggle Llama or Azure chat) | ✅ Done (Kaggle Llama default) |
+| **3** | Frontend `UploadPanel` + `TopicTree` wired to upload + build_topics | ✅ Done |
+| **4** | Backend `/topic/{id}` + Frontend `TopicView` (explanation + image gallery) | 🟡 Partial — LLM explanation + Listen on explanation ✅; image enhance pending |
+| **5** | Backend `/ask` + Frontend `AskPanel` (grounded Q&A) | ⬜ Not started |
+| **6** | Backend `/tts` + Listen button in `TopicView` | 🟡 Partial — `/tts` ✅; Listen narrates explanation (falls back to source text) |
+| **7** | Backend `image_enhance.py` (informational → Lanczos, decorative → gpt-image-2) | 🟡 Partial — `gpt-image-2` helper works; Lanczos routing not wired |
+| **8** | End-to-end polish; revisit `# TODO v2` items | ⬜ Not started |
+
+**When continuing work:** follow this order. Do one step at a time unless the user explicitly asks for multiple steps. Get user test approval between major steps when they ask for that workflow.
+
+---
+
+## 3. Project structure
+
+```
+chapterwise/
+  .cursorrules                 ← this file
+  .gitignore
+  backend/
+    main.py                    ← FastAPI app
+    azure_clients.py           ← Azure TTS/image clients + /debug/azure probes
+    text_provider.py           ← TEXT_PROVIDER routing (Kaggle Llama / Azure chat)
+    pdf_extract.py             ← Per-page text + image extraction
+    topic_builder.py           ← ordered topic tree via text_provider (Kaggle Llama / Azure)
+    topic_detail.py            ← Topic payload + LLM explanation via text_provider
+    qa.py                      ← TODO step 5
+    tts.py                     ← Azure TTS (step 6) ✅
+    image_enhance.py           ← gpt-image-2 helper (step 7 partial)
+    security.py                ← PDF validation, CORS, size limits
+    requirements.txt
+    .env                       ← secrets (gitignored; copy from .env.example)
+    .env.example
+    active_doc.pdf             ← written on upload (gitignored)
+    vendor/                    ← pip --target installs (gitignored)
+    kaggle/
+      chapterwise_gpu_server.py
+      llm_server.py            ← Llama chat on Kaggle GPU
+      chapterwise_kaggle.ipynb
+      prepare_chapterwise_dataset.bat
+      publish_chapterwise_dataset.py
+      README.md
+    kaggle_client.py           ← laptop → Kaggle HTTP client
+  frontend/
+    index.html
+    package.json
+    vite.config.js
+    src/
+      config/api.js            ← API base URL only here
+      utils/apiClient.js
+      context/DocContext.jsx
+      components/
+        UploadPanel.jsx        ← step 3 ✅
+        TopicTree.jsx          ← step 3 ✅
+        TopicView.jsx          ← step 4 partial ✅
+        UploadLoadingScreen.jsx ← animated upload/build loading
+        TopicViewSkeleton.jsx  ← shimmer skeleton while topic loads
+        Skeleton.jsx           ← reusable shimmer block
+        AskPanel.jsx           ← TODO step 5
+      App.jsx
+      main.jsx
+      index.css
+```
+
+---
+
+## 4. Implemented backend
+
+### Endpoints (live)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/health` | Health check (+ Kaggle reachability, `text_provider`, LLM status) |
+| POST | `/upload_pdf` | Save PDF, extract pages; optional `?page_start=&page_end=`; returns `timing` (receive/extract/total seconds) |
+| POST | `/build_topics` | Send extracted text to text provider (Kaggle Llama / Azure) → topic tree; returns `timing.total_seconds` |
+| GET | `/topic/{topic_id}` | Topic metadata, source text, LLM explanation, images |
+| POST | `/tts` | `{ text, voice? }` → MP3 audio |
+| GET | `/debug/text` | Smoke-test text provider (Kaggle Llama or Azure chat) |
+| GET | `/debug/azure` | Smoke-test TTS and image Azure deployments |
+| GET | `/debug/extraction` | Per-page extraction summary |
+| GET | `/debug/extraction/{page}` | Full page text; `?include_image_data=true` for base64 |
+| GET | `/debug/topics` | Full built topic tree + `topics_by_id` |
+
+### Endpoints (planned)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/ask` | `{ topic_id, question }` grounded answer |
+
+### State (in-memory v1)
+
+- `_active_extraction` — full per-page text + images; cleared on new upload
+- `_active_topics` — topic tree + flat `topics_by_id`; cleared on new upload
+- `_explanation_cache` in `topic_detail.py` — per-topic LLM explanations; cleared on new upload
+- Resets on server restart (`# TODO v2`: disk cache)
+
+### PDF extraction (`pdf_extract.py`)
+
+- **PyMuPDF** (`fitz`): images via `get_images(full=True)` + `get_image_rects`; skip icons < 50px
+- **pdfplumber**: page text (preferred); single open per page for text + overlap word counts
+- **Parallel extraction:** `ProcessPoolExecutor` on Linux/Kaggle; `ThreadPoolExecutor` on Windows. `CHAPTERWISE_EXTRACT_WORKERS` (Kaggle default: CPU count).
+- **Page-range extract:** `extract_document(pdf_path, page_start=, page_end=)` — only parses requested pages; returns `num_pages` (PDF total), `page_start`, `page_end`, `pages`.
+- **Kaggle defaults** (in `chapterwise_gpu_server.py`): deferred image base64, skip overlap counts, process pool.
+- Running headers/footers detected once via `PDFMetadataAnalyzer`, then passed to all workers
+- `# TODO v2`: classify formula vs decorative images; defer base64 until topic open; skip re-upload if PDF hash unchanged on Kaggle
+
+### Kaggle remote extraction (`kaggle_client.py`, `kaggle/chapterwise_gpu_server.py`)
+
+- **Dataset:** `eakeswar/chapterwise-models` on Kaggle — publish via `backend/kaggle/publish_chapterwise_dataset.bat`
+- **Flow:** laptop saves PDF → chunked upload to Kaggle → async extract → poll status → fetch result JSON
+- **`kaggle_client.py`:** byte uploads via `_post_with_retry()`; JSON chat via `_post_json_with_retry()` → `POST /chat/completions`
+- **`EXTRACT_PROVIDER`:** `local` | `kaggle` | `auto` (fallback to local if Kaggle fails). **`local` recommended for laptop dev** with page-range testing.
+- **Tunnel:** cloudflared `trycloudflare.com` URL changes each notebook session → update `KAGGLE_API_BASE_URL` in `.env`
+- **Large PDF fixes (2026-07-24):**
+  - Chunked upload: `POST /upload_chunk` (4 MB parts, `KAGGLE_UPLOAD_CHUNK_BYTES`)
+  - Async extract: `POST /extract` → poll `GET /extract/status` → `GET /extract/result` (avoids Cloudflare 524)
+  - Poll retries: `KAGGLE_POLL_TIMEOUT=90`, `KAGGLE_UPLOAD_RETRIES=3`
+- **Kaggle server endpoints:** `/health`, `/chat/completions`, `/upload_pdf`, `/upload_chunk`, `/extract`, `/extract/status`, `/extract/result`, `/upload_and_extract` (small files only)
+- **Kaggle LLM (`llm_server.py`):** default `meta-llama/Llama-3.2-1B-Instruct` (4-bit on GPU). Requires `HF_TOKEN` on notebook + **gated-model access** on Hugging Face (“Expand to review and access” on model page). Set `CHAPTERWISE_LLM_PRELOAD=1` to load at startup (avoids Cloudflare 502 on first chat). Recommended notebook limits: `CHAPTERWISE_LLM_MAX_INPUT_CHARS=12000`, `CHAPTERWISE_LLM_MAX_NEW_TOKENS=2048` (raise to 3072 if JSON truncated).
+- **Note:** PDF parsing uses **CPU** (PyMuPDF/pdfplumber); **GPU** used for Llama chat via `POST /chat/completions`.
+- `# TODO v2`: host extract on Azure Container Apps + Blob instead of free Cloudflare tunnel
+
+---
+
+### Topic building (`topic_builder.py`)
+
+- **`TEXT_PROVIDER`:** `kaggle` | `azure` | `auto` — routed via `text_provider.py` → Kaggle `/chat/completions` or Azure chat
+- **Current default (laptop):** `TEXT_PROVIDER=kaggle` → **`meta-llama/Llama-3.2-1B-Instruct`** on Kaggle GPU
+- Chunks by page range (default **8** pages for dev, `CHAPTERWISE_TOPIC_CHUNK_PAGES`; was 18)
+- Strict JSON schema: `{ chapters: [{ title, page_start, page_end, sections: [...] }] }`
+- Chunks concatenated in order; IDs assigned (`ch1`, `ch1_s1`, `ch1_s1_ss1`, …)
+- `extract_topic_json()` + `_repair_topic_json_string()` repair malformed LLM JSON; `_call_topic_model()` retries once with a “valid JSON only” follow-up on parse failure
+- Removed stale `get_openai_client()` reference (all chat via `text_provider`)
+- Optional body on `/build_topics`: `{ page_start, page_end, chunk_pages }` for testing a single chapter
+
+---
+
+## 5. Implemented frontend
+
+- **UploadPanel:** PDF upload → `/upload_pdf` → `/build_topics`; optional “Test first pages only” passes `?page_start=1&page_end=N` to **upload** (partial extract) and build_topics; shows upload/extract + build timing after success
+- **TopicTree:** Collapsible chapter → section → subsection; **never re-sort** client-side
+- **TopicView:** Fetches `GET /topic/{id}`; shows **LLM explanation** + source text + image gallery; **Listen** calls `POST /tts` with title + explanation (falls back to source text); shimmer skeleton while loading
+- **UploadLoadingScreen:** Animated main-panel loading during upload/build (shimmer progress bar + step labels + **live elapsed timer** + layout preview)
+- **DocContext:** `topicTree`, `activeTopicId`, `topicCache`, `uploadTiming`, `buildTiming`, upload/build phases
+- **App.jsx:** Sidebar + `TopicView` or `UploadLoadingScreen` in main panel
+- Functional components, hooks only, **no `<form>` tags**, use `onClick` / file input handlers
+
+### Run commands
+
+```powershell
+# Backend (port 8766)
+python backend/main.py
+
+# Frontend (port 5173)
+cd frontend && npm run dev
+```
+
+```powershell
+# Install deps (once)
+python -m pip install --target backend/vendor -r backend/requirements.txt
+cd frontend && npm install
+```
+
+---
+
+## 6. Session updates & decisions (changelog)
+
+- **Step 1:** Created backend with `/upload_pdf`, `pdf_extract.py`, `security.py`, debug extraction endpoints. Smoke-tested 90-page PDF.
+- **Step 2:** Added `topic_builder.py`, `/build_topics`, `/debug/topics`. Azure OpenAI v1 API via standard `OpenAI` client + `base_url` + deployment name as `model=`.
+- **Step 3:** Scaffolded Vite React frontend; `UploadPanel` + `TopicTree` + `DocContext` + `apiClient.js`.
+- **PDF size limit:** Set to **500 MB** (`CHAPTERWISE_MAX_PDF_BYTES=524288000`).
+- **`.env`:** Created `backend/.env` with Azure Foundry credentials (text, TTS, image deployments). Never commit `.env`.
+- **Upload slowness (300 MB books):** Upload waits for **full local extraction** of every page before responding — not OpenAI. Discussed but not implemented: fast upload + background extraction, OpenAI/hybrid parsing for scanned PDFs.
+- **Parallel extraction:** All CPU cores used locally; pdfplumber one open per page.
+- **Kaggle remote extraction:** Bundle publish scripts, GPU notebook server, `kaggle_client.py`, `EXTRACT_PROVIDER` routing in `main.py`.
+- **2026-07-24 — Kaggle large-PDF reliability:** Chunked upload (`/upload_chunk`), async extract with polling (`/extract/status`, `/extract/result`), poll retries. Published updated bundle to `eakeswar/chapterwise-models`. Tunnel URL must be refreshed in `.env` each notebook session.
+- **2026-07-24 — Page-range extraction:** `extract_document()` + `/upload_pdf?page_start=&page_end=`; frontend “Test first pages only” now limits parse scope (full PDF still uploaded to Kaggle).
+- **2026-07-24 — Azure topic build blocked:** API key + base URL for `edzhub-resource` work, but **`AZURE_TEXT_DEPLOYMENT=gpt-4o-mini` not deployed** → `DeploymentNotFound` on `/build_topics`. Need deployment created in Azure Foundry or new resource. API URLs are not browsable in Chrome (POST-only).
+- **2026-07-27 — Azure deployment audit:** TTS (`gpt-4o-mini-tts`) and images (`gpt-image-2`) work on `https://edzhub-resource.services.ai.azure.com/openai/v1`. Chat (`gpt-4o-mini`) still `DeploymentNotFound` on `https://edzhub-resource.openai.azure.com/openai/v1`. Added `azure_clients.py`, `GET /debug/azure`, `POST /tts`, `tts.py`, basic `image_enhance.py`.
+- **2026-07-27 — Step 4 shell:** `topic_detail.py`, `GET /topic/{topic_id}`, `TopicView.jsx` (source text + images, no LLM explanation yet), `topicCache`, shimmer skeletons, Listen button (TTS on source text).
+- **2026-07-27 — Upload UX:** `UploadLoadingScreen.jsx` with animated progress bar + step labels during upload/build.
+- **2026-07-27 — Kaggle tunnel refreshed:** `KAGGLE_API_BASE_URL=https://maiden-evaluate-ranked-short.trycloudflare.com` (ephemeral; update each notebook session). Verified reachable with 2 GPUs. Full PDF upload to Kaggle works; `/build_topics` still blocked by missing Azure chat deployment.
+- **2026-07-28 — Azure re-verified:** `GET /debug/azure` → TTS + image OK; chat `gpt-4o-mini` still `DeploymentNotFound`. Use **deployment name** (not model name) for `AZURE_TEXT_DEPLOYMENT`. TTS smoke-tested with alternate voice (`shimmer`); samples in `backend/test_output/`.
+- **2026-07-28 — Upload timing:** `/upload_pdf` returns `timing` (`receive_seconds`, `extract_seconds`, `total_seconds`, `file_mb`); `/build_topics` returns `timing.total_seconds`. Frontend live elapsed timer on `UploadLoadingScreen`; final times in `UploadPanel` success line. Backend logs include timing breakdown.
+- **2026-07-28 — Kaggle tunnel refreshed:** `KAGGLE_API_BASE_URL=https://dial-controversial-lifetime-upgrade.trycloudflare.com` (ephemeral). Verified reachable (2 GPUs). Kaggle notebook pip warnings (`dopamine-rl`/`gym`, `gradio`/`pillow`) are harmless — extract server starts fine. Ensure `KAGGLE_API_SECRET` matches notebook (not placeholder). Laptop `EXTRACT_PROVIDER=kaggle`.
+- **2026-07-30 — Kaggle Llama for text:** `llm_server.py` + `POST /chat/completions` on Kaggle GPU server (default `meta-llama/Llama-3.2-1B-Instruct`, 4-bit). Laptop `text_provider.py` + `TEXT_PROVIDER=kaggle|azure|auto`; `topic_builder.py` routes chat through it. `GET /debug/text` smoke test. Requires `HF_TOKEN` on Kaggle for gated Llama models.
+- **2026-07-30 — Dataset published:** Republished `eakeswar/chapterwise-models` with `llm_server.py`. Laptop `TEXT_PROVIDER=kaggle`, `EXTRACT_PROVIDER=kaggle`.
+- **2026-07-30 — Kaggle tunnel refreshed:** `KAGGLE_API_BASE_URL=https://lodge-salad-match-learned.trycloudflare.com` (ephemeral). Verified reachable (2 GPUs, Llama configured). Servers started for test then stopped. End-to-end upload → build topics pending user test after notebook + `HF_TOKEN` ready.
+- **2026-08-03 — Step 4 LLM explanation:** `topic_detail.py` calls `text_provider.chat_completion` for grounded plain-language explanations; returns `explanation`, `explanation_status`, `explanation_error`. In-memory `_explanation_cache` cleared on upload. `TopicView` shows explanation; Listen prefers explanation over source text. CSS: `.topic-explanation`, `.topic-notice-error`.
+- **2026-08-03 — Kaggle chat client fix:** `kaggle_client.py` — added `_post_json_with_retry()`; `kaggle_chat_completions()` was incorrectly passing `json=` to byte-upload `_post_with_retry()` → `name 'json' unexpected` / broken `/debug/text`.
+- **2026-08-03 — Topic build fixes:** Removed dead `get_openai_client()` from `topic_builder.py`. Added JSON repair (trailing commas, unclosed brackets) + one automatic retry with “valid JSON only” follow-up for Llama 1B malformed output.
+- **2026-08-03 — Kaggle ops (Class 9 Science textbook test, 301 MB / 1299 pages):** Full PDF still uploads to Kaggle even with “Test first pages only” (page range limits **extract** only). **`EXTRACT_PROVIDER=local`** recommended for laptop dev (skip 76-chunk Kaggle upload; ~3 min local extract for 15–20 pages). **`CHAPTERWISE_TOPIC_CHUNK_PAGES=8`** reduces Llama VRAM per chunk. **`KAGGLE_API_SECRET`** must match notebook cell 2 exactly (placeholder causes 401). **`HF_TOKEN`** + Hugging Face gated access required for Llama (“Expand to review and access” on model page; affiliation can be `Individual`). Set notebook `CHAPTERWISE_LLM_PRELOAD=1`, `CHAPTERWISE_LLM_4BIT=1`, lower `MAX_INPUT_CHARS` / `MAX_NEW_TOKENS` to avoid CUDA OOM on T4. Cloudflare tunnel dies mid-session (502 / error 1033) — refresh URL each notebook run. First successful `/debug/text` after preload: `"ok": true`, `"llm_loaded": true`. Sample born-digital NCERT-style PDF pages extract well with pdfplumber (no GPU OCR needed for v1).
+
+---
+
+## 7. Environment variables (`backend/.env`)
+
+Azure OpenAI uses **Foundry v1 API** — `OpenAI` class with `base_url` + `api_key`; pass **deployment name** as `model=`. Do **not** use `AzureOpenAI` with `api_version`.
+
+```env
+AZURE_OPENAI_API_KEY=...
+TEXT_PROVIDER=kaggle
+CHAPTERWISE_LLM_TIMEOUT=600
+
+# Azure chat (when TEXT_PROVIDER=azure or auto fallback)
+AZURE_OPENAI_BASE_URL=https://edzhub-resource.openai.azure.com/openai/v1
+AZURE_TEXT_DEPLOYMENT=gpt-4o-mini
+AZURE_SERVICES_BASE_URL=https://edzhub-resource.services.ai.azure.com/openai/v1
+AZURE_TTS_BASE_URL=https://edzhub-resource.services.ai.azure.com/openai/v1
+AZURE_TTS_DEPLOYMENT=gpt-4o-mini-tts
+AZURE_IMAGES_BASE_URL=https://edzhub-resource.services.ai.azure.com/openai/v1
+AZURE_IMAGE_DEPLOYMENT=gpt-image-2
+
+CHAPTERWISE_CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+CHAPTERWISE_TOPIC_CHUNK_PAGES=8
+CHAPTERWISE_MAX_PDF_BYTES=524288000
+CHAPTERWISE_EXTRACT_WORKERS=16
+BLUR_VARIANCE_THRESHOLD=100
+SMALL_IMAGE_MIN_DIM=400
+
+# Kaggle remote extract (optional)
+KAGGLE_ENABLED=true
+KAGGLE_API_BASE_URL=https://discrete-random-calls-utilize.trycloudflare.com
+KAGGLE_API_SECRET=...
+EXTRACT_PROVIDER=local
+KAGGLE_EXTRACT_TIMEOUT=900
+KAGGLE_CHUNK_TIMEOUT=120
+KAGGLE_UPLOAD_CHUNK_BYTES=4194304
+KAGGLE_CHUNK_THRESHOLD_BYTES=10485760
+KAGGLE_UPLOAD_RETRIES=3
+KAGGLE_POLL_INTERVAL=5
+KAGGLE_POLL_TIMEOUT=90
+KAGGLE_RESULT_TIMEOUT=300
+KAGGLE_USERNAME=...
+KAGGLE_API_TOKEN=...
+KAGGLE_DATASET_SLUG=chapterwise-models
+
+# Kaggle notebook only (not laptop .env unless testing locally)
+# HF_TOKEN=hf_...
+# CHAPTERWISE_LLM_MODEL=meta-llama/Llama-3.2-1B-Instruct
+# CHAPTERWISE_LLM_PRELOAD=1
+# CHAPTERWISE_LLM_4BIT=1
+# CHAPTERWISE_LLM_MAX_INPUT_CHARS=12000
+# CHAPTERWISE_LLM_MAX_NEW_TOKENS=2048
+```
+
+Frontend `.env` optional: `VITE_API_BASE_URL=http://127.0.0.1:8766`
+
+---
+
+## 8. Explicit non-goals for v1 (flag as `# TODO v2`)
+
+- No **Azure** chat fallback when `TEXT_PROVIDER=kaggle` — Kaggle Llama handles topic text; TTS/images stay on Azure
+- No karaoke word highlighting — play/pause audio per topic only
+- No image **generation** for formula/diagram images — Lanczos upscale only for informational images; `gpt-image-2` only for small/blurry **decorative** images (step 7)
+- No multi-user auth — single active document
+- No vector DB — topic Q&A uses raw topic text in prompt context
+- No disk caching — in-memory only
+- No OpenAI for full-book PDF parsing (local extract first; hybrid vision fallback is v2)
+
+---
+
+## 9. Remaining implementation notes (steps 4–7)
+
+### `/topic/{topic_id}` + `TopicView`
+
+- ✅ Join topic node from `topics_by_id` with page-range slice of `_active_extraction`
+- ✅ Source text + image gallery in `TopicView`
+- ✅ LLM explanation via `text_provider.chat_completion` in `topic_detail.py` (`explanation_status`: ready | skipped | failed)
+- ✅ Listen button via `POST /tts` (narrates explanation, falls back to source text)
+- ⬜ Run images through `image_enhance.py` before return (step 7 can be wired incrementally)
+- `# TODO v2`: formula vs decorative classification in gallery
+
+### `/ask` + `AskPanel`
+
+- `qa.py`: topic explanation + raw source text in context; refuse to guess outside topic
+
+### `/tts` + Listen
+
+- ✅ `tts.py` + `POST /tts` on `AZURE_TTS_BASE_URL` (services endpoint)
+- ✅ Listen button in `TopicView` (explanation text, fallback to source text)
+- ⬜ Optional: `POST /tts` with `{ topic_id }` after explanation exists
+
+### `image_enhance.py` (§4a)
+
+- ✅ `generate_decorative_image()` via `gpt-image-2` (smoke-tested)
+- ⬜ Classify informational vs decorative (Veda-style heuristics: overlapWordCount, aspect/area)
+- ⬜ Quality: small (< 400px) or blurry (Laplacian variance < 100)
+- ⬜ Route: informational → **Lanczos only**; decorative + low quality → `gpt-image-2` (never regenerate formulas)
+- ⬜ In-memory cache keyed by image hash
+
+---
+
+## 10. Coding preferences
+
+- Python 3.11+, FastAPI, async where possible
+- pip installs → `backend/vendor/` via `--target`
+- Print logging OK for v1
+- **Ask for approval before editing existing files** unless the user explicitly says to proceed/build/implement
+- Never commit `backend/.env`, `backend/vendor/`, `backend/active_doc.pdf`
+- Never hardcode API keys in source
+- Keep changes scoped; match existing style
+- Frontend: minimal CSS (no Tailwind in chapterwise v1), functional components only
+
+---
+
+## 11. Known issues & ops
+
+- **Text/chat:** `TEXT_PROVIDER=kaggle` uses Kaggle `POST /chat/completions` (Llama on GPU). `auto` falls back to Azure if Kaggle text fails. Verify with `GET /debug/text` (`llm_loaded: true` on Kaggle health when preloaded).
+- **Azure chat (optional):** Only required when `TEXT_PROVIDER=azure` or as auto fallback. TTS and images still use `services.ai.azure.com`. Verify TTS/images with `GET /debug/azure`. **`gpt-4o-mini` chat deployment still not provisioned** on `edzhub-resource`.
+- **Azure endpoints:** Text chat → `AZURE_OPENAI_BASE_URL`; TTS + images → `AZURE_TTS_BASE_URL` / `AZURE_IMAGES_BASE_URL` (services endpoint, must include `/openai/v1`).
+- **Kaggle tunnel:** Free `trycloudflare.com` URLs are ephemeral — refresh `KAGGLE_API_BASE_URL` each notebook run. Tunnel can die mid-long-extract (502 / Cloudflare 1033). `KAGGLE_API_SECRET` must **exactly match** notebook cell 2. Prefer **`EXTRACT_PROVIDER=local`** for fast dev; use `auto` or `kaggle` for full offloaded extract.
+- **Kaggle Llama gated model:** Accept license on https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct (“Expand to review and access”); set `HF_TOKEN` in notebook. 403 “not in authorized list” → HF access not granted yet.
+- **Kaggle Llama runtime:** Use `CHAPTERWISE_LLM_PRELOAD=1` to avoid 502 while weights load. CUDA OOM on T4 → lower `CHAPTERWISE_TOPIC_CHUNK_PAGES`, `CHAPTERWISE_LLM_MAX_INPUT_CHARS`, `CHAPTERWISE_LLM_MAX_NEW_TOKENS`. Llama 1B may return malformed topic JSON → repair + retry in `topic_builder.py`.
+- **Large PDFs (e.g. 300 MB):** Browser sends full file to laptop every upload. “Test first pages only” limits **extract** page range, not upload size. Kaggle path uploads all 76×4 MB chunks before extract. Local extract of 15–20 pages from 301 MB PDF ≈ 3–5 min on Windows.
+- Only one upload/build at a time (`_extraction_lock`); backend blocks `/health` during active job
+- **Port 8766 in use:** Stop prior `python backend/main.py` (Ctrl+C) before restarting
+- Restart backend after `.env` changes; restart clears in-memory extraction/topics/explanations
+- Frontend dev server: port **5173** — must be running separately (`npm run dev`)
+- After Kaggle code changes: republish dataset + re-run notebook cells 1–2; copy new tunnel URL to `.env`
+- Kaggle notebook pip warnings (`dopamine-rl`/`gym`, `gradio`/`pillow`) are harmless
+
+---
+
+## 12. Next step when user says “continue”
+
+**Next:** (1) Confirm end-to-end: upload (Test first pages only) → build topics → topic tree → open topic → explanation + Listen. (2) **Step 5:** `qa.py` + `/ask` + `AskPanel`. (3) Step 7 image routing incrementally. (4) `# TODO v2`: skip Kaggle upload when page range set; background extract; disk cache.
+
+**Dev defaults (2026-08-03):** `EXTRACT_PROVIDER=local`, `TEXT_PROVIDER=kaggle`, `CHAPTERWISE_TOPIC_CHUNK_PAGES=8`. Kaggle notebook: `HF_TOKEN`, `CHAPTERWISE_LLM_PRELOAD=1`, `CHAPTERWISE_LLM_4BIT=1`.
