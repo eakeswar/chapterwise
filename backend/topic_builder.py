@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 DEFAULT_CHUNK_PAGES = int(os.environ.get("CHAPTERWISE_TOPIC_CHUNK_PAGES", "18"))
+_RETRY_ASSISTANT_MAX_CHARS = int(os.environ.get("CHAPTERWISE_TOPIC_RETRY_CHARS", "2000"))
 
 
 def _repair_topic_json_string(json_str: str) -> str:
@@ -84,7 +85,7 @@ def _call_topic_model(messages: list[dict[str, str]]) -> dict[str, Any]:
             print(f"Topic JSON parse failed (attempt {attempt + 1}/2): {exc}")
             if attempt == 0:
                 conversation = conversation + [
-                    {"role": "assistant", "content": output[:12000]},
+                    {"role": "assistant", "content": output[:_RETRY_ASSISTANT_MAX_CHARS]},
                     {
                         "role": "user",
                         "content": (
@@ -111,6 +112,139 @@ def _format_page_chunk(pages: list[dict[str, Any]], page_start: int, page_end: i
         lines.append(text if text else "[no extractable text on this page]")
         lines.append("")
     return "\n".join(lines).strip()
+
+
+_ANTI_LEAK_SENTENCE = (
+    "The example above shows STRUCTURE ONLY using placeholder text in "
+    "angle brackets. Do NOT copy any wording from the example. Every "
+    "chapter/section/subsection title in your answer must come from the "
+    "actual source text below, word-for-word or a close paraphrase of it."
+)
+
+
+def _collect_tree_titles(tree: dict[str, Any]) -> list[str]:
+    titles: list[str] = []
+    for chapter in tree.get("chapters") or []:
+        if not isinstance(chapter, dict):
+            continue
+        titles.append(str(chapter.get("title") or ""))
+        for section in chapter.get("sections") or []:
+            if not isinstance(section, dict):
+                continue
+            titles.append(str(section.get("title") or ""))
+            for subsection in section.get("subsections") or []:
+                if isinstance(subsection, dict):
+                    titles.append(str(subsection.get("title") or ""))
+    return [title.strip() for title in titles if title.strip()]
+
+
+def _title_word_overlap(left: str, right: str) -> float:
+    left_words = {word for word in left.lower().split() if word}
+    right_words = {word for word in right.lower().split() if word}
+    if not left_words or not right_words:
+        return 0.0
+    shared = left_words & right_words
+    smaller = min(len(left_words), len(right_words))
+    return len(shared) / smaller
+
+
+def _warn_sibling_title_duplicates(
+    titles: list[str],
+    level: str,
+    chunk_start: int,
+    chunk_end: int,
+) -> None:
+    cleaned = [title.strip() for title in titles if title.strip()]
+    for index, left in enumerate(cleaned):
+        for right in cleaned[index + 1:]:
+            if left.lower() == right.lower() or _title_word_overlap(left, right) > 0.9:
+                print(
+                    f"WARNING: topic tree chunk pages {chunk_start}-{chunk_end} has "
+                    f"near-duplicate sibling {level} titles: {left!r} vs {right!r}"
+                )
+
+
+def _warn_chunk_tree_sanity(
+    tree: dict[str, Any],
+    chunk_start: int,
+    chunk_end: int,
+    *,
+    chunk_text: str = "",
+    prompt_text: str = "",
+) -> None:
+    """Log warnings when a chunk tree looks over-split or copied from the prompt."""
+    chapters = tree.get("chapters") or []
+    chapter_count = len(chapters)
+    if chapter_count > 5:
+        print(
+            f"WARNING: topic tree chunk pages {chunk_start}-{chunk_end} has "
+            f"{chapter_count} top-level chapter nodes (expected ≤5 for a single in-chapter chunk)."
+        )
+
+    chapter_section_titles: list[str] = []
+    for chapter in chapters:
+        if isinstance(chapter, dict):
+            chapter_section_titles.append(str(chapter.get("title") or ""))
+            for section in chapter.get("sections") or []:
+                if isinstance(section, dict):
+                    chapter_section_titles.append(str(section.get("title") or ""))
+
+    if chapter_section_titles:
+        activity_count = sum(
+            1 for title in chapter_section_titles if "activity" in title.lower()
+        )
+        if activity_count > len(chapter_section_titles) / 2:
+            print(
+                f"WARNING: topic tree chunk pages {chunk_start}-{chunk_end} has "
+                f"{activity_count}/{len(chapter_section_titles)} chapter/section titles "
+                f"containing 'Activity' (expected mostly real headings, not activity labels)."
+            )
+
+    if chunk_text and prompt_text:
+        chunk_lower = chunk_text.lower()
+        prompt_lower = prompt_text.lower()
+        leaked: list[str] = []
+        for title in _collect_tree_titles(tree):
+            title_lower = title.lower()
+            if len(title_lower) < 4:
+                continue
+            if title_lower in prompt_lower and title_lower not in chunk_lower:
+                leaked.append(title)
+        if leaked:
+            preview = ", ".join(leaked[:5])
+            extra = f" (+{len(leaked) - 5} more)" if len(leaked) > 5 else ""
+            print(
+                f"WARNING: topic tree chunk pages {chunk_start}-{chunk_end} may copy "
+                f"prompt/example text (titles in prompt but not source): {preview}{extra}"
+            )
+
+    chapter_titles = [
+        str(chapter.get("title") or "")
+        for chapter in chapters
+        if isinstance(chapter, dict)
+    ]
+    _warn_sibling_title_duplicates(chapter_titles, "chapter", chunk_start, chunk_end)
+
+    for chapter in chapters:
+        if not isinstance(chapter, dict):
+            continue
+        section_titles = [
+            str(section.get("title") or "")
+            for section in chapter.get("sections") or []
+            if isinstance(section, dict)
+        ]
+        _warn_sibling_title_duplicates(section_titles, "section", chunk_start, chunk_end)
+        for section in chapter.get("sections") or []:
+            if not isinstance(section, dict):
+                continue
+            subsection_titles = [
+                str(subsection.get("title") or "")
+                for subsection in section.get("subsections") or []
+                if isinstance(subsection, dict)
+            ]
+            _warn_sibling_title_duplicates(
+                subsection_titles, "subsection", chunk_start, chunk_end
+            )
 
 
 def _build_chunk_messages(page_start: int, page_end: int, chunk_text: str) -> list[dict[str, str]]:
@@ -141,20 +275,69 @@ def _build_chunk_messages(page_start: int, page_end: int, chunk_text: str) -> li
         "    }\n"
         "  ]\n"
         "}\n\n"
-        "Rules:\n"
+        "What counts as each level:\n"
+        "1. CHAPTER — only a numbered/titled top-level heading (e.g. chapter number + title "
+        "at the start of a major unit, or when a chunk clearly begins a new major topic area). "
+        f"Within one chunk that is still inside a single chapter (pages {page_start}-{page_end}), "
+        "there should almost always be exactly ONE chapter node, not several parallel chapters.\n"
+        "2. SECTION — only a numbered subheading in the pattern like \"1.1 Title Case Heading\" "
+        "(a real topic label in the book). NOT an instruction sentence, NOT a bullet step, "
+        "NOT an \"Activity N.N\" label.\n"
+        "3. ACTIVITY boxes — any line starting with \"Activity\" followed by a number is CONTENT "
+        "inside the surrounding section. It may appear at most once as a single subsection leaf "
+        "(title like \"Activity 1.1\" only). It must NEVER become a chapter or section. "
+        "Never nest sections/subsections under an activity from its instruction steps, bullets, "
+        "or follow-up questions. Instruction sentences, bullet steps, and questions inside an "
+        "activity are never topic nodes.\n\n"
+        "Hard limits for this page range:\n"
+        "- Do not create more than 4 section-level nodes.\n"
+        "- Do not create more than 3 subsection-level nodes total for this page range.\n"
+        "- Exception: only if the text unambiguously contains that many distinct numbered "
+        "section headings (e.g. 1.1, 1.2, 1.3 …), not activities or bullets.\n\n"
+        "General rules:\n"
         f"- Only include topics whose content appears on pages {page_start} through {page_end}.\n"
         "- Preserve the order topics appear in the book. Never alphabetize or reorder.\n"
         "- page_start and page_end must be integers within the chunk range.\n"
         "- Use empty arrays for sections with no subsections.\n"
-        "- Prefer a shallow tree: chapters and sections are enough; use subsections only when clearly needed.\n"
-        "- Titles should match or closely paraphrase headings in the source text.\n"
+        "- Do not invent a subsection from an ordinary sentence just because a "
+        "section lacks a numbered subheading or Activity box. If there is no real "
+        "numbered subheading and no Activity box under a section, its subsections "
+        "array MUST be empty — do not fabricate a subsection title from body text.\n"
+        "- Titles should copy the exact numbered heading string from the source "
+        "text whenever one is present (e.g. a line matching a pattern like "
+        "'1.1 <Title>' or '1.1.1 <TITLE>'). Only paraphrase if no such numbered "
+        "heading exists in the source text for that node.\n"
         "- Do not invent topics that are not supported by the provided text.\n"
         "- Ignore running headers, footers, and page numbers as topic titles.\n"
-        "- Output ONLY the JSON object — no markdown fences, no commentary."
+        "- Output ONLY the JSON object — no markdown fences, no commentary.\n\n"
+        "Worked example (structure only — placeholder titles, not real book text):\n"
+        "Fictional source excerpt:\n"
+        "  <example chapter heading line>\n"
+        "  <N.N example section heading>\n"
+        "  Activity <N.N>\n"
+        "  • <example instruction bullet>\n"
+        "  • <example instruction bullet>\n"
+        "  <example follow-up question>\n"
+        "  <N.N another section heading>\n"
+        "\n"
+        "CORRECT output shape:\n"
+        "  chapters: [\n"
+        "    { title: \"<chapter title from source text>\", sections: [\n"
+        "      { title: \"<N.N section title from source text>\", subsections: [\n"
+        "        { title: \"Activity <N.N>\" }\n"
+        "      ]},\n"
+        "      { title: \"<N.N section title from source text>\", subsections: [] }\n"
+        "    ]}\n"
+        "  ]\n"
+        "WRONG (do NOT do this): separate chapters for \"Activity <N.N>\", sections for "
+        "\"<example instruction bullet>\", subsections for \"<example follow-up question>\", "
+        "or multiple top-level chapters inside one chunk.\n\n"
+        f"{_ANTI_LEAK_SENTENCE}"
     )
+    user_content = f"{_ANTI_LEAK_SENTENCE}\n\n{chunk_text}"
     return [
         {"role": "system", "content": system_instructions},
-        {"role": "user", "content": chunk_text},
+        {"role": "user", "content": user_content},
     ]
 
 
@@ -269,7 +452,15 @@ def build_topics_from_pages(
         print(f"Building topics for pages {current}-{chunk_end} …")
         messages = _build_chunk_messages(current, chunk_end, chunk_text)
         chunk_tree = _call_topic_model(messages)
-        chunk_trees.append(_normalize_chunk_tree(chunk_tree, current, chunk_end))
+        normalized = _normalize_chunk_tree(chunk_tree, current, chunk_end)
+        _warn_chunk_tree_sanity(
+            normalized,
+            current,
+            chunk_end,
+            chunk_text=chunk_text,
+            prompt_text=messages[0]["content"] + "\n" + messages[1]["content"],
+        )
+        chunk_trees.append(normalized)
         current = chunk_end + 1
 
     merged = merge_chunk_trees(chunk_trees)

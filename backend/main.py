@@ -39,7 +39,7 @@ from kaggle_client import (
 )
 from pdf_extract import extract_document
 from security import MAX_PDF_BYTES, cors_origins, validate_pdf_bytes
-from topic_builder import build_topics_from_pages
+from topic_builder import DEFAULT_CHUNK_PAGES, build_topics_from_pages
 from topic_detail import build_topic_detail, clear_explanation_cache
 from tts import DEFAULT_VOICE, synthesize_speech
 
@@ -132,6 +132,7 @@ def _serialize_page(page: dict[str, Any], include_image_data: bool) -> dict[str,
 @app.get("/health")
 def health() -> dict[str, Any]:
     from kaggle_client import kaggle_status
+    from pdf_extract import text_extractor_name, use_rapidocr_text
     from text_provider import text_provider_name
 
     extract_provider = resolve_provider("EXTRACT_PROVIDER", "local")
@@ -139,6 +140,8 @@ def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "extract_provider": extract_provider,
+        "text_extractor": text_extractor_name(),
+        "rapidocr_enabled": use_rapidocr_text(),
         "text_provider": text_provider_name(),
         "kaggle": kaggle,
     }
@@ -303,7 +306,7 @@ def build_topics(body: BuildTopicsRequest | None = None) -> dict[str, Any]:
                 extraction["pages"],
                 page_start=request.page_start,
                 page_end=request.page_end,
-                chunk_pages=request.chunk_pages or 18,
+                chunk_pages=request.chunk_pages or DEFAULT_CHUNK_PAGES,
             )
             build_seconds = round(time.perf_counter() - build_started, 2)
             _active_topics = result

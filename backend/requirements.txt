@@ -3,6 +3,7 @@ uvicorn[standard]
 python-multipart
 pymupdf
 pdfplumber
+rapidocr-pdf>=0.4.0
 python-dotenv
 openai
 requests

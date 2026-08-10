@@ -28,11 +28,15 @@ def model_id() -> str:
 
 
 def max_new_tokens() -> int:
-    return int(os.environ.get("CHAPTERWISE_LLM_MAX_NEW_TOKENS", "4096"))
+    return int(os.environ.get("CHAPTERWISE_LLM_MAX_NEW_TOKENS", "1024"))
 
 
 def max_input_chars() -> int:
-    return int(os.environ.get("CHAPTERWISE_LLM_MAX_INPUT_CHARS", "32000"))
+    return int(os.environ.get("CHAPTERWISE_LLM_MAX_INPUT_CHARS", "12000"))
+
+
+_TRUNC_SUFFIX = "\n\n[truncated for model context limit]"
+_ASSISTANT_CAP_CHARS = int(os.environ.get("CHAPTERWISE_LLM_ASSISTANT_CAP_CHARS", "2000"))
 
 
 def _quiet_pip(*packages: str) -> None:
@@ -86,29 +90,71 @@ def status() -> dict[str, Any]:
     }
 
 
+def _message_total_chars(messages: list[dict[str, str]]) -> int:
+    return sum(len(str(message.get("content") or "")) for message in messages)
+
+
 def _truncate_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Keep system prompt; trim the last user message if the payload is too large."""
+    """Trim conversation to max_input_chars across all roles (not only the last user)."""
     limit = max_input_chars()
-    total = sum(len(str(message.get("content") or "")) for message in messages)
-    if total <= limit:
-        return messages
+    working: list[dict[str, str]] = [
+        {
+            "role": str(message.get("role") or "user"),
+            "content": str(message.get("content") or ""),
+        }
+        for message in messages
+    ]
+    if _message_total_chars(working) <= limit:
+        return working
 
-    trimmed: list[dict[str, str]] = []
-    budget = limit
-    for index, message in enumerate(messages):
-        role = str(message.get("role") or "user")
-        content = str(message.get("content") or "")
-        if index < len(messages) - 1:
-            trimmed.append({"role": role, "content": content})
-            budget -= len(content)
-            continue
+    for message in working:
+        if message["role"] == "assistant" and len(message["content"]) > _ASSISTANT_CAP_CHARS:
+            message["content"] = message["content"][:_ASSISTANT_CAP_CHARS] + _TRUNC_SUFFIX
+            print(
+                f"chapterwise LLM: truncated assistant message to "
+                f"{_ASSISTANT_CAP_CHARS} chars"
+            )
 
-        if len(content) > max(budget, 1000):
-            keep = max(budget, 1000)
-            content = content[:keep] + "\n\n[truncated for model context limit]"
-            print(f"chapterwise LLM: truncated user input to {keep} chars")
-        trimmed.append({"role": role, "content": content})
-    return trimmed
+    trim_order: list[tuple[int, int]] = []
+    for index, message in enumerate(working):
+        if message["role"] == "assistant":
+            trim_order.append((0, index))
+    for index, message in enumerate(working):
+        if message["role"] == "user" and index != len(working) - 1:
+            trim_order.append((1, index))
+    if working:
+        trim_order.append((2, len(working) - 1))
+    if working and working[0]["role"] == "system":
+        trim_order.append((3, 0))
+    trim_order.sort(key=lambda item: item[0])
+
+    while _message_total_chars(working) > limit:
+        trimmed_any = False
+        overflow = _message_total_chars(working) - limit
+        for _, index in trim_order:
+            message = working[index]
+            content = message["content"]
+            if index == len(working) - 1:
+                min_keep = 200
+            elif message["role"] == "system":
+                min_keep = 1500
+            else:
+                min_keep = 500
+            if len(content) <= min_keep:
+                continue
+            new_len = max(min_keep, len(content) - overflow)
+            if new_len < len(content):
+                message["content"] = content[:new_len] + _TRUNC_SUFFIX
+                print(
+                    f"chapterwise LLM: truncated {message['role']} message "
+                    f"to {new_len} chars (total budget {limit})"
+                )
+                trimmed_any = True
+                break
+        if not trimmed_any:
+            break
+
+    return working
 
 
 def _load_model() -> None:
@@ -206,12 +252,16 @@ def generate_chat(messages: list[dict[str, str]], *, temperature: float = 0.2) -
                 max_new_tokens=max_new_tokens(),
                 temperature=max(temperature, 0.01) if do_sample else None,
                 do_sample=do_sample,
+                repetition_penalty=1.2,
+                no_repeat_ngram_size=4,
                 pad_token_id=_tokenizer.pad_token_id or _tokenizer.eos_token_id,
                 eos_token_id=_tokenizer.eos_token_id,
             )
 
         new_tokens = output_ids[0, inputs["input_ids"].shape[-1] :]
         text = _tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         if not text:
             raise RuntimeError("LLM returned an empty response.")
         return text
