@@ -135,20 +135,22 @@ chapterwise/
 
 - **Dataset:** `eakeswar/chapterwise-models` on Kaggle — publish via `backend/kaggle/publish_chapterwise_dataset.bat`
 - **Flow:** laptop saves PDF → chunked upload to Kaggle → async extract → poll status → fetch result JSON
-- **`kaggle_client.py`:** byte uploads via `_post_with_retry()`; JSON chat via `_post_json_with_retry()` → `POST /chat/completions`
+- **`kaggle_client.py`:** byte uploads via `_post_with_retry()`; JSON chat via `_post_json_with_retry()` → prefer **async** `POST /chat` → poll `GET /chat/status` → `GET /chat/result` (falls back to sync `POST /chat/completions` if `/chat` is 404)
 - **`EXTRACT_PROVIDER`:** `local` | `kaggle` | `auto` (fallback to local if Kaggle fails). **`local` recommended for laptop dev** with page-range testing.
 - **Tunnel:** cloudflared `trycloudflare.com` URL changes each notebook session → update `KAGGLE_API_BASE_URL` in `.env`
 - **Large PDF fixes (2026-07-24):**
   - Chunked upload: `POST /upload_chunk` (4 MB parts, `KAGGLE_UPLOAD_CHUNK_BYTES`)
   - Async extract: `POST /extract` → poll `GET /extract/status` → `GET /extract/result` (avoids Cloudflare 524)
   - Poll retries: `KAGGLE_POLL_TIMEOUT=90`, `KAGGLE_UPLOAD_RETRIES=3`
-- **Kaggle server endpoints:** `/health`, `/chat/completions`, `/upload_pdf`, `/upload_chunk`, `/extract`, `/extract/status`, `/extract/result`, `/upload_and_extract` (small files only)
+- **Kaggle server endpoints:** `/health`, `/chat`, `/chat/status`, `/chat/result`, `/chat/completions` (sync legacy), `/upload_pdf`, `/upload_chunk`, `/extract`, `/extract/status`, `/extract/result`, `/upload_and_extract` (small files only)
+- **Auth:** `Authorization: Bearer <KAGGLE_API_SECRET>` required on chat/extract/upload. `/health` is unauthenticated. Laptop `.env` and notebook secret must match exactly (placeholder → 401).
 - **Kaggle LLM (`llm_server.py`):** default `meta-llama/Llama-3.2-1B-Instruct` (4-bit on GPU). Requires `HF_TOKEN` on notebook + **gated-model access** on Hugging Face. Set `CHAPTERWISE_LLM_PRELOAD=1` to load at startup.
   - **Defaults (2026-08-10):** `CHAPTERWISE_LLM_MAX_INPUT_CHARS=12000`, `CHAPTERWISE_LLM_MAX_NEW_TOKENS=1024`, `CHAPTERWISE_LLM_ASSISTANT_CAP_CHARS=2000`.
   - **Truncation:** enforces total char budget across **all** messages (caps assistant, trims page chunk, not only last user). `torch.cuda.empty_cache()` after each generate.
   - **Generation:** `repetition_penalty=1.2`, `no_repeat_ngram_size=4`. `top_p` warning from transformers config is harmless.
-  - **Notebook cell 2** should set the limits above (+ optional `PYTORCH_ALLOC_CONF=expandable_segments:True`) before starting the server.
-- **Note:** PDF parsing uses **CPU** (PyMuPDF/pdfplumber); **GPU** used for Llama chat via `POST /chat/completions`.
+  - **HF auth:** reads `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN`; calls `huggingface_hub.login(token=…)`; passes **`token=`** (not deprecated `use_auth_token=`) to `AutoTokenizer.from_pretrained` / `AutoModelForCausalLM.from_pretrained`.
+  - **Notebook cell 2:** load secrets via `UserSecretsClient` — labels **`KAGGLE_API_SECRET`** and **`HF_TOKEN`** (Add-ons → Secrets). Print `present`/`length` only (never the token). Set LLM limits + optional `PYTORCH_ALLOC_CONF=expandable_segments:True` before `!python` server.
+- **Note:** PDF parsing uses **CPU** (PyMuPDF/pdfplumber); **GPU** used for Llama chat via async `/chat` (or sync `/chat/completions`).
 - `# TODO v2`: host extract on Azure Container Apps + Blob instead of free Cloudflare tunnel
 
 ---
@@ -157,10 +159,11 @@ chapterwise/
 
 - **`TEXT_PROVIDER`:** `kaggle` | `azure` | `auto` — routed via `text_provider.py` → Kaggle `/chat/completions` or Azure chat
 - **Current default (laptop):** `TEXT_PROVIDER=kaggle` → **`meta-llama/Llama-3.2-1B-Instruct`** on Kaggle GPU
-- Chunks by page range — default from **`CHAPTERWISE_TOPIC_CHUNK_PAGES`** (laptop dev: **8**). `/build_topics` uses env default via `DEFAULT_CHUNK_PAGES` (was hardcoded 18 in `main.py`).
+- Chunks by page range — default from **`CHAPTERWISE_TOPIC_CHUNK_PAGES`** (laptop often **4** when fighting tunnel timeouts; was 8 / 18). `/build_topics` uses env default via `DEFAULT_CHUNK_PAGES`.
 - Strict JSON schema: `{ chapters: [{ title, page_start, page_end, sections: [...] }] }`
 - Chunks concatenated in order; IDs assigned (`ch1`, `ch1_s1`, `ch1_s1_ss1`, …)
 - `extract_topic_json()` + `_repair_topic_json_string()` repair malformed LLM JSON; `_call_topic_model()` retries once with “valid JSON only” follow-up (**assistant retry capped at 2000 chars** via `CHAPTERWISE_TOPIC_RETRY_CHARS`, was 12000)
+- Chat to Kaggle goes through **`kaggle_chat_completions()`** (async poll preferred) so long Llama runs do not hit Cloudflare **524**.
 - **Prompt rules (2026-08-10):** Activity boxes never become chapters/sections; hard limits (≤4 sections, ≤3 subsections per chunk); placeholder worked example + `_ANTI_LEAK_SENTENCE`; copy numbered headings from source; empty subsections when no real subheading/Activity.
 - **Sanity warnings:** `_warn_chunk_tree_sanity()` — too many chapters, Activity in titles, prompt leakage, sibling near-duplicate titles.
 - Optional body on `/build_topics`: `{ page_start, page_end, chunk_pages }` for testing a single chapter
@@ -224,6 +227,8 @@ cd frontend && npm install
 - **2026-08-03 — Kaggle ops (Class 9 Science textbook test, 301 MB / 1299 pages):** Full PDF still uploads to Kaggle even with “Test first pages only” (page range limits **extract** only). **`EXTRACT_PROVIDER=local`** recommended for laptop dev (skip 76-chunk Kaggle upload; ~3 min local extract for 15–20 pages). **`CHAPTERWISE_TOPIC_CHUNK_PAGES=8`** reduces Llama VRAM per chunk. **`KAGGLE_API_SECRET`** must match notebook cell 2 exactly (placeholder causes 401). **`HF_TOKEN`** + Hugging Face gated access required for Llama (“Expand to review and access” on model page; affiliation can be `Individual`). Set notebook `CHAPTERWISE_LLM_PRELOAD=1`, `CHAPTERWISE_LLM_4BIT=1`, lower `MAX_INPUT_CHARS` / `MAX_NEW_TOKENS` to avoid CUDA OOM on T4. Cloudflare tunnel dies mid-session (502 / error 1033) — refresh URL each notebook run. First successful `/debug/text` after preload: `"ok": true`, `"llm_loaded": true`. Sample born-digital NCERT-style PDF pages extract well with pdfplumber (no GPU OCR needed for v1).
 - **2026-08-10 — Extract perf (header/footer):** `pdf_extract.py` header/footer scan was parsing all 1299 pages even for `page_start=1&page_end=10` (~93s of ~98s). Fixed: sample **36 evenly spaced pages** + cache by file fingerprint. Pages 1–10 local extract dropped to ~6–8s. Added `CHAPTERWISE_DEBUG_TIMING=1`. Laptop `CHAPTERWISE_TEXT_EXTRACTOR=rapidocr`, `CHAPTERWISE_RAPIDOCR_FORCE=0`.
 - **2026-08-10 — Topic build OOM + tunnel 502:** Llama 1B on T4 OOM during `/chat/completions` when prompt + `max_new_tokens=4096` spiked attention (~13 GB). Pattern: first call often succeeds; **JSON retry** (bad output + full chunk) triggers CUDA OOM or Cloudflare **502 Bad gateway** (tunnel loses Kaggle mid-request). Fixes: `llm_server.py` — defaults `MAX_NEW_TOKENS=1024`, `MAX_INPUT_CHARS=12000`, truncate **all** messages to total budget, assistant cap 2000, `empty_cache()` after generate, `repetition_penalty=1.2`. `topic_builder.py` — retry assistant capped at `CHAPTERWISE_TOPIC_RETRY_CHARS=2000`. `main.py` — `/build_topics` uses `CHAPTERWISE_TOPIC_CHUNK_PAGES` from env (not hardcoded 18). Republished `eakeswar/chapterwise-models`. Topic prompt tightened (Activity rules, section limits, anti-leak example); sanity warnings for bad trees. Tree quality on Class 9 Science OCR still rough (fabricated subsections, parallel “chapters” for 1.1/1.2).
+- **2026-08-11 — Kaggle secrets + HF auth:** Notebook cell 2 loads **`KAGGLE_API_SECRET`** and **`HF_TOKEN`** via `UserSecretsClient` (Add-ons → Secrets). Missing `HF_TOKEN` secret caused 401 gated-repo (not HF permissions). Missing/mismatched `KAGGLE_API_SECRET` caused laptop `401 Invalid or missing API token` on `/chat/completions` while `/health` still looked fine. `llm_server` prints `HF auth token present/len` before load; uses `token=` + `huggingface_hub.login`.
+- **2026-08-11 — Async chat (tunnel 524):** Sync `/chat/completions` often exceeded Cloudflare free-tunnel ~100s → **524 A timeout occurred** even when Llama finished on Kaggle. Added Kaggle `POST /chat` + `GET /chat/status` + `GET /chat/result`; laptop `kaggle_client.kaggle_chat_completions()` polls like extract. Republished dataset. Prefer **Test first pages only = 8** and `CHAPTERWISE_TOPIC_CHUNK_PAGES=4` while validating. End-to-end build still needs user confirmation after attaching latest dataset version.
 
 ---
 
@@ -246,7 +251,7 @@ AZURE_IMAGES_BASE_URL=https://edzhub-resource.services.ai.azure.com/openai/v1
 AZURE_IMAGE_DEPLOYMENT=gpt-image-2
 
 CHAPTERWISE_CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
-CHAPTERWISE_TOPIC_CHUNK_PAGES=8
+CHAPTERWISE_TOPIC_CHUNK_PAGES=4
 CHAPTERWISE_TOPIC_RETRY_CHARS=2000
 CHAPTERWISE_MAX_PDF_BYTES=524288000
 CHAPTERWISE_EXTRACT_WORKERS=16
@@ -346,12 +351,12 @@ Frontend `.env` optional: `VITE_API_BASE_URL=http://127.0.0.1:8766`
 
 ## 11. Known issues & ops
 
-- **Text/chat:** `TEXT_PROVIDER=kaggle` uses Kaggle `POST /chat/completions` (Llama on GPU). `auto` falls back to Azure if Kaggle text fails. Verify with `GET /debug/text` (`llm_loaded: true` on Kaggle health when preloaded).
+- **Text/chat:** `TEXT_PROVIDER=kaggle` uses Kaggle async `/chat` (poll) when available, else sync `/chat/completions`. `auto` falls back to Azure if Kaggle text fails. Verify with `GET /debug/text` (`llm_loaded: true` on Kaggle health when preloaded).
 - **Azure chat (optional):** Only required when `TEXT_PROVIDER=azure` or as auto fallback. TTS and images still use `services.ai.azure.com`. Verify TTS/images with `GET /debug/azure`. **`gpt-4o-mini` chat deployment still not provisioned** on `edzhub-resource`.
 - **Azure endpoints:** Text chat → `AZURE_OPENAI_BASE_URL`; TTS + images → `AZURE_TTS_BASE_URL` / `AZURE_IMAGES_BASE_URL` (services endpoint, must include `/openai/v1`).
-- **Kaggle tunnel:** Free `trycloudflare.com` URLs are ephemeral — refresh `KAGGLE_API_BASE_URL` each notebook run. **`/health` is fast**; **`/chat/completions` can fail with 502** when the tunnel loses Kaggle during a long LLM call (often on JSON **retry** after malformed first response). `KAGGLE_API_SECRET` must **exactly match** notebook cell 2. Prefer **`EXTRACT_PROVIDER=local`** for fast dev; use `auto` or `kaggle` for full offloaded extract.
-- **Kaggle Llama gated model:** Accept license on https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct (“Expand to review and access”); set `HF_TOKEN` in notebook. 403 “not in authorized list” → HF access not granted yet.
-- **Kaggle Llama runtime:** Use `CHAPTERWISE_LLM_PRELOAD=1`. CUDA OOM on T4 → `CHAPTERWISE_TOPIC_CHUNK_PAGES=8`, `CHAPTERWISE_LLM_MAX_INPUT_CHARS=12000`, `CHAPTERWISE_LLM_MAX_NEW_TOKENS=1024`, republish dataset after `llm_server.py` changes. Llama 1B may return malformed topic JSON → repair + retry in `topic_builder.py` (retry assistant capped at 2000 chars).
+- **Kaggle tunnel:** Free `trycloudflare.com` URLs are ephemeral — refresh `KAGGLE_API_BASE_URL` each notebook run. **`/health` is fast and unauthenticated**. Long sync `/chat/completions` can fail with **524** (timeout) or **502**; use async `/chat` polling on latest dataset. `KAGGLE_API_SECRET` must **exactly match** notebook UserSecrets (placeholder/`PASTE_…` → 401 on chat). Prefer **`EXTRACT_PROVIDER=local`** for fast dev; use `auto` or `kaggle` for full offloaded extract.
+- **Kaggle Llama gated model:** Accept license on https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct (“Expand to review and access”); set `HF_TOKEN` via Kaggle Add-ons → Secrets. 401 with `present=False` → secret not loaded; 401 with `present=True` → HF access not granted for that token’s account.
+- **Kaggle Llama runtime:** Use `CHAPTERWISE_LLM_PRELOAD=1`. CUDA OOM on T4 → `CHAPTERWISE_TOPIC_CHUNK_PAGES=4` or `8`, `CHAPTERWISE_LLM_MAX_INPUT_CHARS=12000`, `CHAPTERWISE_LLM_MAX_NEW_TOKENS=1024`, republish dataset after `llm_server.py` / `chapterwise_gpu_server.py` changes. Llama 1B may return malformed topic JSON → repair + retry in `topic_builder.py` (retry assistant capped at 2000 chars).
 - **Large PDFs (e.g. 300 MB):** Browser sends full file to laptop every upload. “Test first pages only” limits **extract** page range, not upload size. Kaggle path uploads all 76×4 MB chunks before extract. Local extract of 15–20 pages from 301 MB PDF ≈ 3–5 min on Windows.
 - Only one upload/build at a time (`_extraction_lock`); backend blocks `/health` during active job
 - **Port 8766 in use:** Stop prior `python backend/main.py` (Ctrl+C) before restarting
@@ -364,6 +369,6 @@ Frontend `.env` optional: `VITE_API_BASE_URL=http://127.0.0.1:8766`
 
 ## 12. Next step when user says “continue”
 
-**Next:** (1) Kaggle: attach latest `chapterwise-models`, re-run cells 1–2, refresh tunnel URL. (2) End-to-end: upload (Test first pages only) → build topics → topic tree → open topic → explanation + Listen. (3) **Step 5:** `qa.py` + `/ask` + `AskPanel`. (4) Step 7 image routing incrementally. (5) `# TODO v2`: skip Kaggle upload when page range set; background extract; disk cache.
+**Next:** (1) Confirm end-to-end with latest dataset (async `/chat`): upload Test first pages only (8) → build topics → tree → topic → explanation + Listen. (2) **Step 5:** `qa.py` + `/ask` + `AskPanel`. (3) Step 7 image routing incrementally. (4) `# TODO v2`: skip Kaggle upload when page range set; background extract; disk cache.
 
-**Dev defaults (2026-08-10):** `EXTRACT_PROVIDER=local`, `TEXT_PROVIDER=kaggle`, `CHAPTERWISE_TOPIC_CHUNK_PAGES=8`, `CHAPTERWISE_TEXT_EXTRACTOR=rapidocr`. Kaggle notebook cell 2: `HF_TOKEN`, `CHAPTERWISE_LLM_PRELOAD=1`, `CHAPTERWISE_LLM_4BIT=1`, `CHAPTERWISE_LLM_MAX_INPUT_CHARS=12000`, `CHAPTERWISE_LLM_MAX_NEW_TOKENS=1024`.
+**Dev defaults (2026-08-11):** `EXTRACT_PROVIDER=local`, `TEXT_PROVIDER=kaggle`, `CHAPTERWISE_TOPIC_CHUNK_PAGES=4`, `CHAPTERWISE_TEXT_EXTRACTOR=rapidocr`. Kaggle notebook cell 2 secrets: `KAGGLE_API_SECRET`, `HF_TOKEN`; env: `CHAPTERWISE_LLM_PRELOAD=1`, `CHAPTERWISE_LLM_4BIT=1`, `CHAPTERWISE_LLM_MAX_INPUT_CHARS=12000`, `CHAPTERWISE_LLM_MAX_NEW_TOKENS=1024`.

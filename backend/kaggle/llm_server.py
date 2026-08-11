@@ -173,6 +173,22 @@ def _load_model() -> None:
 
             mid = model_id()
             token = _hf_token()
+            print(
+                f"chapterwise LLM: HF auth token in server process: "
+                f"present={bool(token)}, len={len(token or '')}"
+            )
+            if not token:
+                print(
+                    "chapterwise LLM: no HF_TOKEN in environment — "
+                    "set via notebook UserSecretsClient before !python server"
+                )
+            else:
+                try:
+                    from huggingface_hub import login
+
+                    login(token=token, add_to_git_credential=False)
+                except Exception as exc:
+                    print(f"chapterwise LLM: huggingface_hub.login failed: {exc}")
             print(f"chapterwise LLM: loading {mid} …")
             tokenizer = AutoTokenizer.from_pretrained(mid, token=token)
             if tokenizer.pad_token is None:

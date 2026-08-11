@@ -112,6 +112,12 @@ _extract_job: dict[str, object] = {
     "page_start": None,
     "page_end": None,
 }
+_chat_lock = threading.Lock()
+_chat_job: dict[str, object] = {
+    "status": "idle",
+    "error": None,
+    "result": None,
+}
 
 
 class ExtractRequest(BaseModel):
@@ -128,6 +134,80 @@ class ChatRequest(BaseModel):
     messages: list[ChatMessage] = Field(min_length=1)
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     model: str | None = None
+
+
+def _reset_chat_job() -> None:
+    with _chat_lock:
+        _chat_job["status"] = "idle"
+        _chat_job["error"] = None
+        _chat_job["result"] = None
+
+
+def _format_chat_result(content: str, elapsed: float) -> dict:
+    try:
+        import llm_server
+
+        model = llm_server.model_id()
+    except Exception:
+        model = os.environ.get("CHAPTERWISE_LLM_MODEL", "meta-llama/Llama-3.2-1B-Instruct")
+    return {
+        "id": "chapterwise-kaggle",
+        "object": "chat.completion",
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "timing": {"total_seconds": elapsed},
+    }
+
+
+def _run_chat_worker(messages: list[dict[str, str]], temperature: float) -> None:
+    started = time.perf_counter()
+    try:
+        import llm_server
+    except ImportError:
+        with _chat_lock:
+            _chat_job["status"] = "error"
+            _chat_job["error"] = "llm_server.py is not available on this Kaggle server."
+            _chat_job["result"] = None
+        return
+
+    try:
+        content = llm_server.generate_chat(messages, temperature=temperature)
+        elapsed = round(time.perf_counter() - started, 2)
+        print(f"chapterwise LLM chat complete in {elapsed}s ({len(content)} chars)")
+        with _chat_lock:
+            _chat_job["status"] = "complete"
+            _chat_job["error"] = None
+            _chat_job["result"] = _format_chat_result(content, elapsed)
+    except Exception as exc:
+        print(f"chapterwise LLM chat failed: {exc}")
+        with _chat_lock:
+            _chat_job["status"] = "error"
+            _chat_job["error"] = str(exc)
+            _chat_job["result"] = None
+
+
+def _start_chat_async(messages: list[dict[str, str]], temperature: float) -> dict:
+    with _chat_lock:
+        status = _chat_job["status"]
+        if status == "running":
+            return {"ok": True, "status": "running", "started": False}
+
+        _chat_job["status"] = "running"
+        _chat_job["error"] = None
+        _chat_job["result"] = None
+
+    threading.Thread(
+        target=_run_chat_worker,
+        args=(messages, temperature),
+        daemon=True,
+    ).start()
+    return {"ok": True, "status": "running", "started": True}
 
 
 def _reset_extract_job() -> None:
@@ -447,6 +527,49 @@ def extract_result(_: None = Depends(verify_token)) -> dict:
             raise HTTPException(status_code=400, detail="No extraction result available")
         assert isinstance(_extract_job["result"], dict)
         return _extract_job["result"]
+
+
+@app.post("/chat")
+def chat_start(body: ChatRequest, _: None = Depends(verify_token)) -> dict:
+    """Start LLM chat in the background (avoids Cloudflare 524 on long generations)."""
+    messages = [{"role": message.role, "content": message.content} for message in body.messages]
+    return _start_chat_async(messages, body.temperature)
+
+
+@app.get("/chat/status")
+def chat_status(_: None = Depends(verify_token)) -> dict:
+    with _chat_lock:
+        status = _chat_job["status"]
+        payload: dict[str, object] = {"ok": True, "status": status}
+        if status == "error":
+            payload["error"] = _chat_job["error"]
+        elif status == "complete" and _chat_job["result"]:
+            result = _chat_job["result"]
+            if isinstance(result, dict):
+                timing = result.get("timing") or {}
+                if isinstance(timing, dict):
+                    payload["total_seconds"] = timing.get("total_seconds")
+                choices = result.get("choices") or []
+                if choices and isinstance(choices[0], dict):
+                    message = choices[0].get("message") or {}
+                    if isinstance(message, dict):
+                        content = message.get("content") or ""
+                        payload["content_chars"] = len(str(content))
+        return payload
+
+
+@app.get("/chat/result")
+def chat_result(_: None = Depends(verify_token)) -> dict:
+    with _chat_lock:
+        status = _chat_job["status"]
+        if status == "running":
+            raise HTTPException(status_code=409, detail="Chat still running")
+        if status == "error":
+            raise HTTPException(status_code=500, detail=str(_chat_job["error"]))
+        if status != "complete" or not _chat_job["result"]:
+            raise HTTPException(status_code=400, detail="No chat result available")
+        assert isinstance(_chat_job["result"], dict)
+        return _chat_job["result"]
 
 
 def _run_extraction_sync(

@@ -418,13 +418,129 @@ def kaggle_extract_pdf(
         return kaggle_extract_document(page_start=page_start, page_end=page_end)
 
 
+def _kaggle_fetch_chat_result(timeout: int = RESULT_TIMEOUT) -> dict:
+    base = kaggle_base_url()
+    if not base:
+        raise RuntimeError("KAGGLE_API_BASE_URL is not set")
+
+    resp = _get_with_retry(
+        f"{base}/chat/result",
+        headers=kaggle_headers(None),
+        timeout=timeout,
+        label="chat result",
+    )
+    if not resp.ok:
+        detail = resp.text[:500]
+        raise RuntimeError(f"Kaggle /chat/result failed ({resp.status_code}): {detail}")
+    return resp.json()
+
+
+def _kaggle_chat_completions_async(
+    messages: list[dict[str, str]],
+    *,
+    temperature: float = 0.2,
+    timeout: int,
+) -> str:
+    """Start async chat on Kaggle and poll until complete (avoids tunnel 524)."""
+    base = kaggle_base_url()
+    if not base:
+        raise RuntimeError("KAGGLE_API_BASE_URL is not set")
+
+    payload = {
+        "messages": messages,
+        "temperature": temperature,
+    }
+    resp = _post_json_with_retry(
+        f"{base}/chat",
+        headers=kaggle_headers("application/json"),
+        json_body=payload,
+        timeout=POLL_TIMEOUT,
+        label="chat start",
+    )
+    if not resp.ok:
+        detail = resp.text[:500]
+        raise RuntimeError(f"Kaggle /chat failed ({resp.status_code}): {detail}")
+
+    start_data = resp.json()
+    if start_data.get("status") == "complete":
+        return _extract_chat_content(_kaggle_fetch_chat_result(timeout=RESULT_TIMEOUT))
+
+    deadline = time.time() + timeout
+    last_status = start_data.get("status", "unknown")
+    while time.time() < deadline:
+        try:
+            status_resp = _get_with_retry(
+                f"{base}/chat/status",
+                headers=kaggle_headers(None),
+                timeout=POLL_TIMEOUT,
+                label="chat status",
+            )
+        except _RETRYABLE as exc:
+            print(f"Kaggle chat poll failed ({exc}); will retry …")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        if not status_resp.ok:
+            detail = status_resp.text[:500]
+            raise RuntimeError(
+                f"Kaggle /chat/status failed ({status_resp.status_code}): {detail}"
+            )
+
+        status_data = status_resp.json()
+        last_status = status_data.get("status", "unknown")
+        if last_status == "complete":
+            total_seconds = status_data.get("total_seconds")
+            content_chars = status_data.get("content_chars")
+            print(
+                f"Kaggle chat complete"
+                f"{f' in {total_seconds}s' if total_seconds is not None else ''}"
+                f"{f' ({content_chars} chars)' if content_chars is not None else ''}"
+                " — fetching result …"
+            )
+            return _extract_chat_content(_kaggle_fetch_chat_result(timeout=RESULT_TIMEOUT))
+        if last_status == "error":
+            raise RuntimeError(f"Kaggle chat failed: {status_data.get('error')}")
+
+        print(f"Kaggle chat running … (status={last_status})")
+        time.sleep(POLL_INTERVAL)
+
+    raise RuntimeError(
+        f"Kaggle chat timed out after {timeout}s (last status={last_status})"
+    )
+
+
+def _extract_chat_content(data: dict) -> str:
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError("Kaggle chat response did not include choices.")
+    content = (choices[0].get("message") or {}).get("content") or ""
+    cleaned = content.strip()
+    if not cleaned:
+        raise RuntimeError("Kaggle chat returned empty content.")
+    return cleaned
+
+
 def kaggle_chat_completions(
     messages: list[dict[str, str]],
     *,
     temperature: float = 0.2,
     timeout: int | None = None,
 ) -> str:
-    """Call Kaggle /chat/completions and return assistant text."""
+    """Call Kaggle Llama chat and return assistant text (async poll to avoid tunnel 524)."""
+    deadline = timeout or LLM_TIMEOUT
+    try:
+        return _kaggle_chat_completions_async(
+            messages,
+            temperature=temperature,
+            timeout=deadline,
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        if "Kaggle /chat failed (404)" in message or "Kaggle /chat failed (405)" in message:
+            print("Kaggle async /chat not available on server; trying sync /chat/completions …")
+        else:
+            raise
+
     base = kaggle_base_url()
     if not base:
         raise RuntimeError("KAGGLE_API_BASE_URL is not set")
@@ -437,19 +553,11 @@ def kaggle_chat_completions(
         f"{base}/chat/completions",
         headers=kaggle_headers("application/json"),
         json_body=payload,
-        timeout=timeout or LLM_TIMEOUT,
+        timeout=deadline,
         label="chat/completions",
     )
     if not resp.ok:
         detail = resp.text[:500]
         raise RuntimeError(f"Kaggle /chat/completions failed ({resp.status_code}): {detail}")
 
-    data = resp.json()
-    choices = data.get("choices") or []
-    if not choices:
-        raise RuntimeError("Kaggle chat response did not include choices.")
-    content = (choices[0].get("message") or {}).get("content") or ""
-    cleaned = content.strip()
-    if not cleaned:
-        raise RuntimeError("Kaggle chat returned empty content.")
-    return cleaned
+    return _extract_chat_content(resp.json())
