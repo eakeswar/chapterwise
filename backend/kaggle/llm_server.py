@@ -28,11 +28,16 @@ def model_id() -> str:
 
 
 def max_new_tokens() -> int:
-    return int(os.environ.get("CHAPTERWISE_LLM_MAX_NEW_TOKENS", "1024"))
+    return int(os.environ.get("CHAPTERWISE_LLM_MAX_NEW_TOKENS", "512"))
 
 
 def max_input_chars() -> int:
     return int(os.environ.get("CHAPTERWISE_LLM_MAX_INPUT_CHARS", "12000"))
+
+
+def max_generate_seconds() -> float:
+    """Hard wall-clock cap for a single model.generate call (avoids infinite hangs)."""
+    return float(os.environ.get("CHAPTERWISE_LLM_MAX_TIME_SECONDS", "90"))
 
 
 _TRUNC_SUFFIX = "\n\n[truncated for model context limit]"
@@ -250,7 +255,25 @@ def generate_chat(messages: list[dict[str, str]], *, temperature: float = 0.2) -
 
     prepared = _truncate_messages(messages)
     with _gen_lock:
+        import time
+
         import torch
+        from transformers import StoppingCriteria, StoppingCriteriaList
+
+        class _TimeLimitCriteria(StoppingCriteria):
+            """Abort generate when wall clock exceeds max_time (more reliable than max_time alone)."""
+
+            def __init__(self, deadline: float) -> None:
+                self.deadline = deadline
+                self.fired = False
+
+            def __call__(self, input_ids, scores, **kwargs) -> bool:  # noqa: ANN001
+                if time.perf_counter() >= self.deadline:
+                    if not self.fired:
+                        self.fired = True
+                        print("chapterwise LLM: time-stop fired — aborting generate")
+                    return True
+                return False
 
         prompt = _tokenizer.apply_chat_template(
             prepared,
@@ -260,26 +283,50 @@ def generate_chat(messages: list[dict[str, str]], *, temperature: float = 0.2) -
         inputs = _tokenizer(prompt, return_tensors="pt")
         device = next(_model.parameters()).device
         inputs = {key: value.to(device) for key, value in inputs.items()}
+        input_tokens = int(inputs["input_ids"].shape[-1])
+        max_time = max_generate_seconds()
+        max_tokens = max_new_tokens()
+        time_criteria = _TimeLimitCriteria(time.perf_counter() + max_time)
 
         do_sample = temperature > 0
-        with torch.no_grad():
-            output_ids = _model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens(),
-                temperature=max(temperature, 0.01) if do_sample else None,
-                do_sample=do_sample,
-                repetition_penalty=1.2,
-                no_repeat_ngram_size=4,
-                pad_token_id=_tokenizer.pad_token_id or _tokenizer.eos_token_id,
-                eos_token_id=_tokenizer.eos_token_id,
-            )
+        print(
+            f"chapterwise LLM: generate start "
+            f"(input_tokens={input_tokens}, max_new_tokens={max_tokens}, "
+            f"max_time={max_time}s, temperature={temperature})"
+        )
+        started = time.perf_counter()
+        generate_kwargs: dict[str, Any] = {
+            "max_new_tokens": max_tokens,
+            "max_time": max_time,
+            "stopping_criteria": StoppingCriteriaList([time_criteria]),
+            "repetition_penalty": 1.2,
+            "no_repeat_ngram_size": 4,
+            "pad_token_id": _tokenizer.pad_token_id or _tokenizer.eos_token_id,
+            "eos_token_id": _tokenizer.eos_token_id,
+            "do_sample": do_sample,
+        }
+        if do_sample:
+            generate_kwargs["temperature"] = max(temperature, 0.01)
 
+        with torch.no_grad():
+            output_ids = _model.generate(**inputs, **generate_kwargs)
+
+        elapsed = round(time.perf_counter() - started, 2)
         new_tokens = output_ids[0, inputs["input_ids"].shape[-1] :]
         text = _tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        stop_note = " [time-stop]" if time_criteria.fired else ""
+        print(
+            f"chapterwise LLM: generate done in {elapsed}s "
+            f"({len(new_tokens)} new tokens, {len(text)} chars){stop_note}"
+        )
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         if not text:
-            raise RuntimeError("LLM returned an empty response.")
+            raise RuntimeError(
+                "LLM returned an empty response"
+                + (" after time-stop" if time_criteria.fired else "")
+                + "."
+            )
         return text
 
 

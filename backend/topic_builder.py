@@ -1,4 +1,8 @@
-"""Send extracted page text to Azure OpenAI or Kaggle Llama and build an ordered topic tree."""
+"""Build an ordered topic tree from extracted PDF pages.
+
+Default path (Plan B): heading regex — no LLM.
+Optional: CHAPTERWISE_TOPIC_BUILDER=llm for the legacy Kaggle/Azure chunk path.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +13,365 @@ from typing import Any
 
 DEFAULT_CHUNK_PAGES = int(os.environ.get("CHAPTERWISE_TOPIC_CHUNK_PAGES", "18"))
 _RETRY_ASSISTANT_MAX_CHARS = int(os.environ.get("CHAPTERWISE_TOPIC_RETRY_CHARS", "2000"))
+
+# regex (default) | llm
+TOPIC_BUILDER = os.environ.get("CHAPTERWISE_TOPIC_BUILDER", "regex").strip().lower()
+
+# Activity with OCR stutter "1.31.31.31.3" → capture 1.3 (requires ≥2 repeats)
+_ACTIVITY_STUTTER_RE = re.compile(
+    r"Activity(?:Activity|\s|_)*?(?P<num>\d+\.\d+)(?:(?P=num)){2,}",
+    re.IGNORECASE,
+)
+_ACTIVITY_RE = re.compile(
+    r"Activity(?:Activity|\s|_)*?(?P<num>\d+\.\d+)\b",
+    re.IGNORECASE,
+)
+# 1.2.3 TITLE … (subsection)
+_SUBSECTION_RE = re.compile(
+    r"(?<![\d.])(?P<num>\d+\.\d+\.\d+)\s+(?P<title>[A-Z][A-Za-z0-9][A-Za-z0-9 \-]{1,60})"
+)
+# 1.3 Title … (section) — not 1.3.1
+_SECTION_RE = re.compile(
+    r"(?<![\d.])(?P<num>\d+\.\d+)(?!\.\d)\s+(?P<title>[A-Z][A-Za-z0-9][A-Za-z0-9 ?'\-]{1,50})"
+)
+# Chapter 1 / OCR "hapterC 1"
+_CHAPTER_RE = re.compile(
+    r"(?:Chapter|hapterC)\s*(?P<num>\d+)\b",
+    re.IGNORECASE,
+)
+
+_SECTION_TITLE_BLOCKLIST = re.compile(
+    r"^(In|The|This|We|As|Of|And|Or|To|For|With|From|On|At|By|If|When|What|"
+    r"How|Why|That|These|Those|There|Here|Also|After|Before|During|While|"
+    r"Have|Has|Had|Does|Do|Did|Could|Will|Would|Should|May|Might|"
+    r"Observe|Arrange|Give|Collect|Take|Put|Record|Start|Note|Keep|"
+    r"Particles|Higher)\b",
+    re.IGNORECASE,
+)
+
+
+def _clean_heading_title(raw: str) -> str:
+    title = re.sub(r"\s+", " ", raw).strip(" .:-_|")
+    title = re.split(
+        r"\s{2,}|(?=Activity\b)|(?=\d+\.\d+(?:\.\d+)?\s+[A-Z])",
+        title,
+        maxsplit=1,
+    )[0].strip(" .:-_|")
+    # Drop OCR stutter fragments like "ofof"
+    title = re.sub(r"\b(\w{2,})\1\b", r"\1", title, flags=re.IGNORECASE)
+    words = title.split()
+    if len(words) > 8:
+        title = " ".join(words[:8])
+    return title[:80]
+
+
+def _looks_like_section_title(title: str) -> bool:
+    cleaned = _clean_heading_title(title)
+    if len(cleaned) < 3:
+        return False
+    if _SECTION_TITLE_BLOCKLIST.match(cleaned):
+        return False
+    words = [word for word in cleaned.split() if any(ch.isalpha() for ch in word)]
+    if not words:
+        return False
+    if len(words) > 10:
+        return False
+    titled = sum(1 for word in words if word[0].isupper())
+    if titled / len(words) >= 0.5:
+        return True
+    letters = [ch for ch in cleaned if ch.isalpha()]
+    upper_ratio = sum(1 for ch in letters if ch.isupper()) / len(letters)
+    return upper_ratio >= 0.45
+
+
+def _scan_page_headings(page_num: int, text: str) -> list[dict[str, Any]]:
+    """Find heading-like matches on one page (document order by start index)."""
+    if not text or not text.strip():
+        return []
+
+    candidates: list[dict[str, Any]] = []
+
+    for match in _CHAPTER_RE.finditer(text):
+        num = match.group("num")
+        candidates.append(
+            {
+                "level": "chapter",
+                "number": num,
+                "title": f"Chapter {num}",
+                "page": page_num,
+                "start": match.start(),
+                "kind": "chapter",
+            }
+        )
+
+    for match in _ACTIVITY_STUTTER_RE.finditer(text):
+        num = match.group("num")
+        candidates.append(
+            {
+                "level": "subsection",
+                "number": num,
+                "title": f"Activity {num}",
+                "page": page_num,
+                "start": match.start(),
+                "end": match.end(),
+                "kind": "activity",
+            }
+        )
+
+    for match in _ACTIVITY_RE.finditer(text):
+        # Skip if already covered by stutter match
+        if any(
+            abs(match.start() - c["start"]) <= 2 and c["kind"] == "activity"
+            for c in candidates
+        ):
+            continue
+        num = match.group("num")
+        candidates.append(
+            {
+                "level": "subsection",
+                "number": num,
+                "title": f"Activity {num}",
+                "page": page_num,
+                "start": match.start(),
+                "end": match.end(),
+                "kind": "activity",
+            }
+        )
+
+    for match in _SUBSECTION_RE.finditer(text):
+        num = match.group("num")
+        title = _clean_heading_title(match.group("title"))
+        if not _looks_like_section_title(title):
+            continue
+        candidates.append(
+            {
+                "level": "subsection",
+                "number": num,
+                "title": f"{num} {title}",
+                "page": page_num,
+                "start": match.start(),
+                "kind": "subsection",
+            }
+        )
+
+    for match in _SECTION_RE.finditer(text):
+        num = match.group("num")
+        title = _clean_heading_title(match.group("title"))
+        if not _looks_like_section_title(title):
+            continue
+        if title.lower().startswith("activity"):
+            continue
+        candidates.append(
+            {
+                "level": "section",
+                "number": num,
+                "title": f"{num} {title}",
+                "page": page_num,
+                "start": match.start(),
+                "kind": "section",
+            }
+        )
+
+    candidates.sort(key=lambda item: (item["start"], {"chapter": 0, "subsection": 1, "section": 2, "activity": 3}.get(item["kind"], 9)))
+
+    filtered: list[dict[str, Any]] = []
+    last_start = -10**9
+    for item in candidates:
+        # Collapse near-duplicate detections at the same spot (OCR double hits).
+        if item["start"] - last_start <= 2:
+            continue
+        filtered.append(item)
+        last_start = item["start"]
+    return filtered
+
+
+def extract_headings(pages: list[dict[str, Any]], page_start: int, page_end: int) -> list[dict[str, Any]]:
+    headings: list[dict[str, Any]] = []
+    for page in pages:
+        page_num = int(page["page"])
+        if page_num < page_start or page_num > page_end:
+            continue
+        headings.extend(_scan_page_headings(page_num, page.get("text") or ""))
+    return headings
+
+
+def _assign_page_ranges(
+    headings: list[dict[str, Any]],
+    page_start: int,
+    page_end: int,
+) -> list[dict[str, Any]]:
+    """
+    Approach (a): non-heading body text belongs to the preceding heading via page_start/page_end.
+    First heading expands back to page_start; last expands forward to page_end.
+    """
+    if not headings:
+        return []
+
+    enriched: list[dict[str, Any]] = []
+    for index, heading in enumerate(headings):
+        node = dict(heading)
+        start = page_start if index == 0 else int(heading["page"])
+        if index + 1 < len(headings):
+            next_page = int(headings[index + 1]["page"])
+            if next_page > int(heading["page"]):
+                end = next_page - 1
+            else:
+                end = int(heading["page"])
+        else:
+            end = page_end
+        node["page_start"] = start
+        node["page_end"] = max(start, min(end, page_end))
+        enriched.append(node)
+    return enriched
+
+
+def _ensure_chapter(chapters: list[dict[str, Any]], page_start: int, page_end: int) -> dict[str, Any]:
+    if chapters:
+        return chapters[-1]
+    chapter = {
+        "title": f"Pages {page_start}–{page_end}",
+        "page_start": page_start,
+        "page_end": page_end,
+        "sections": [],
+    }
+    chapters.append(chapter)
+    return chapter
+
+
+def _ensure_section(
+    chapter: dict[str, Any],
+    *,
+    title: str,
+    page_start: int,
+    page_end: int,
+) -> dict[str, Any]:
+    sections = chapter.setdefault("sections", [])
+    if sections:
+        return sections[-1]
+    section = {
+        "title": title,
+        "page_start": page_start,
+        "page_end": page_end,
+        "subsections": [],
+    }
+    sections.append(section)
+    return section
+
+
+def build_tree_from_headings(
+    headings: list[dict[str, Any]],
+    page_start: int,
+    page_end: int,
+) -> dict[str, Any]:
+    """Assemble chapter → section → subsection tree from ordered headings."""
+    ranged = _assign_page_ranges(headings, page_start, page_end)
+    if not ranged:
+        # Approach (b): nothing matched — one fallback topic covering the whole range.
+        return {
+            "chapters": [
+                {
+                    "title": f"Pages {page_start}–{page_end}",
+                    "page_start": page_start,
+                    "page_end": page_end,
+                    "sections": [],
+                }
+            ]
+        }
+
+    chapters: list[dict[str, Any]] = []
+    current_chapter: dict[str, Any] | None = None
+    current_section: dict[str, Any] | None = None
+
+    for heading in ranged:
+        kind = heading["kind"]
+        page_s = heading["page_start"]
+        page_e = heading["page_end"]
+        title = heading["title"]
+
+        if kind == "chapter":
+            current_chapter = {
+                "title": title,
+                "page_start": page_s,
+                "page_end": page_e,
+                "sections": [],
+            }
+            chapters.append(current_chapter)
+            current_section = None
+            continue
+
+        if current_chapter is None:
+            current_chapter = _ensure_chapter(chapters, page_start, page_end)
+            # Expand synthetic/fallback chapter to include early body pages
+            current_chapter["page_start"] = min(int(current_chapter["page_start"]), page_s)
+            current_chapter["page_end"] = max(int(current_chapter["page_end"]), page_e)
+
+        if kind == "section":
+            current_section = {
+                "title": title,
+                "page_start": page_s,
+                "page_end": page_e,
+                "subsections": [],
+            }
+            current_chapter["sections"].append(current_section)
+            current_chapter["page_end"] = max(int(current_chapter["page_end"]), page_e)
+            continue
+
+        # subsection or activity
+        if current_section is None:
+            current_section = _ensure_section(
+                current_chapter,
+                title="Introduction",
+                page_start=page_s,
+                page_end=page_e,
+            )
+
+        current_section["subsections"].append(
+            {
+                "title": title,
+                "page_start": page_s,
+                "page_end": page_e,
+            }
+        )
+        current_section["page_end"] = max(int(current_section["page_end"]), page_e)
+        current_chapter["page_end"] = max(int(current_chapter["page_end"]), page_e)
+
+    # Stretch first chapter start to range start so preamble body is not dropped
+    if chapters:
+        chapters[0]["page_start"] = page_start
+        chapters[-1]["page_end"] = max(int(chapters[-1]["page_end"]), page_end)
+
+    return {"chapters": chapters}
+
+
+def build_topics_from_headings(
+    pages: list[dict[str, Any]],
+    *,
+    page_start: int,
+    page_end: int,
+) -> dict[str, Any]:
+    """Pure-regex topic build. Does not call Llama/Azure."""
+    headings = extract_headings(pages, page_start, page_end)
+    print(
+        f"Regex topic build: pages {page_start}-{page_end}, "
+        f"{len(headings)} heading match(es)"
+    )
+    for heading in headings:
+        print(
+            f"  p{heading['page']} [{heading['kind']}] {heading['title']}"
+        )
+    tree = build_tree_from_headings(headings, page_start, page_end)
+    tree = assign_topic_ids(tree)
+    flat = flatten_topics(tree)
+    return {
+        "topic_tree": tree,
+        "topics_by_id": flat,
+        "page_start": page_start,
+        "page_end": page_end,
+        "chunk_count": 1,
+        "topic_count": len(flat),
+        "builder": "regex",
+        "heading_count": len(headings),
+    }
 
 
 def _repair_topic_json_string(json_str: str) -> str:
@@ -442,6 +805,15 @@ def build_topics_from_pages(
     if start_page < 1 or end_page > total_pages or start_page > end_page:
         raise ValueError(f"Invalid page range {start_page}-{end_page} for {total_pages}-page document.")
 
+    builder = TOPIC_BUILDER
+    if builder not in ("regex", "llm"):
+        print(f"WARNING: unknown CHAPTERWISE_TOPIC_BUILDER={builder!r}; using regex")
+        builder = "regex"
+
+    if builder == "regex":
+        return build_topics_from_headings(pages, page_start=start_page, page_end=end_page)
+
+    # Legacy LLM chunk path (CHAPTERWISE_TOPIC_BUILDER=llm)
     chunk_trees: list[dict[str, Any]] = []
     chunk_pages = max(1, chunk_pages)
 
@@ -473,4 +845,5 @@ def build_topics_from_pages(
         "page_end": end_page,
         "chunk_count": len(chunk_trees),
         "topic_count": len(flat),
+        "builder": "llm",
     }

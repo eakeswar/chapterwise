@@ -321,6 +321,8 @@ def build_topics(body: BuildTopicsRequest | None = None) -> dict[str, Any]:
                 "page_end": result["page_end"],
                 "chunk_count": result["chunk_count"],
                 "topic_count": result["topic_count"],
+                "builder": result.get("builder", "unknown"),
+                "heading_count": result.get("heading_count"),
                 "chapters": result["topic_tree"]["chapters"],
                 "timing": {
                     "total_seconds": build_seconds,

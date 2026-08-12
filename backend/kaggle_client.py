@@ -20,6 +20,11 @@ RESULT_TIMEOUT = int(os.environ.get("KAGGLE_RESULT_TIMEOUT", "120"))
 LLM_TIMEOUT = int(os.environ.get("CHAPTERWISE_LLM_TIMEOUT", "600"))
 
 _RETRYABLE = (SSLError, ConnectionError, Timeout)
+_TUNNEL_HTTP_RETRY_STATUSES = frozenset({502, 503, 524})
+
+
+def _is_retryable_http_status(status_code: int) -> bool:
+    return status_code in _TUNNEL_HTTP_RETRY_STATUSES
 
 
 def kaggle_base_url() -> str | None:
@@ -89,7 +94,16 @@ def _post_with_retry(
     last_exc: BaseException | None = None
     for attempt in range(retries):
         try:
-            return requests.post(url, headers=headers, data=data, timeout=timeout)
+            resp = requests.post(url, headers=headers, data=data, timeout=timeout)
+            if _is_retryable_http_status(resp.status_code) and attempt + 1 < retries:
+                wait_s = 2**attempt
+                print(
+                    f"Kaggle upload retry {attempt + 2}/{retries} in {wait_s}s "
+                    f"(HTTP {resp.status_code}) …"
+                )
+                time.sleep(wait_s)
+                continue
+            return resp
         except _RETRYABLE as exc:
             last_exc = exc
             if attempt + 1 < retries:
@@ -99,30 +113,6 @@ def _post_with_retry(
     if last_exc is not None:
         raise last_exc
     raise RuntimeError("Kaggle upload failed without an exception")
-
-
-def _post_json_with_retry(
-    url: str,
-    *,
-    headers: dict[str, str],
-    json_body: dict,
-    timeout: int,
-    retries: int = UPLOAD_RETRIES,
-    label: str = "request",
-) -> requests.Response:
-    last_exc: BaseException | None = None
-    for attempt in range(retries):
-        try:
-            return requests.post(url, headers=headers, json=json_body, timeout=timeout)
-        except _RETRYABLE as exc:
-            last_exc = exc
-            if attempt + 1 < retries:
-                wait_s = 2**attempt
-                print(f"Kaggle {label} retry {attempt + 2}/{retries} in {wait_s}s ({exc}) …")
-                time.sleep(wait_s)
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError(f"Kaggle {label} failed without an exception")
 
 
 def _get_with_retry(
@@ -136,7 +126,16 @@ def _get_with_retry(
     last_exc: BaseException | None = None
     for attempt in range(retries):
         try:
-            return requests.get(url, headers=headers, timeout=timeout)
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            if _is_retryable_http_status(resp.status_code) and attempt + 1 < retries:
+                wait_s = 2**attempt
+                print(
+                    f"Kaggle {label} retry {attempt + 2}/{retries} in {wait_s}s "
+                    f"(HTTP {resp.status_code}) …"
+                )
+                time.sleep(wait_s)
+                continue
+            return resp
         except _RETRYABLE as exc:
             last_exc = exc
             if attempt + 1 < retries:
@@ -160,7 +159,16 @@ def _post_json_with_retry(
     last_exc: BaseException | None = None
     for attempt in range(retries):
         try:
-            return requests.post(url, headers=headers, json=json_body or {}, timeout=timeout)
+            resp = requests.post(url, headers=headers, json=json_body or {}, timeout=timeout)
+            if _is_retryable_http_status(resp.status_code) and attempt + 1 < retries:
+                wait_s = 2**attempt
+                print(
+                    f"Kaggle {label} retry {attempt + 2}/{retries} in {wait_s}s "
+                    f"(HTTP {resp.status_code}) …"
+                )
+                time.sleep(wait_s)
+                continue
+            return resp
         except _RETRYABLE as exc:
             last_exc = exc
             if attempt + 1 < retries:
@@ -418,7 +426,11 @@ def kaggle_extract_pdf(
         return kaggle_extract_document(page_start=page_start, page_end=page_end)
 
 
-def _kaggle_fetch_chat_result(timeout: int = RESULT_TIMEOUT) -> dict:
+def _kaggle_fetch_chat_result(
+    timeout: int = RESULT_TIMEOUT,
+    *,
+    expected_job_id: str | None = None,
+) -> dict:
     base = kaggle_base_url()
     if not base:
         raise RuntimeError("KAGGLE_API_BASE_URL is not set")
@@ -429,10 +441,131 @@ def _kaggle_fetch_chat_result(timeout: int = RESULT_TIMEOUT) -> dict:
         timeout=timeout,
         label="chat result",
     )
+    if _is_retryable_http_status(resp.status_code):
+        raise RuntimeError(f"Kaggle /chat/result transient failure ({resp.status_code})")
     if not resp.ok:
         detail = resp.text[:500]
         raise RuntimeError(f"Kaggle /chat/result failed ({resp.status_code}): {detail}")
-    return resp.json()
+    data = resp.json()
+    if expected_job_id:
+        result_job_id = data.get("job_id")
+        if result_job_id and result_job_id != expected_job_id:
+            raise RuntimeError(
+                f"Kaggle /chat/result job_id mismatch "
+                f"(expected {expected_job_id}, got {result_job_id})"
+            )
+    return data
+
+
+def _kaggle_reset_chat() -> None:
+    """Best-effort clear of a stuck Kaggle chat slot."""
+    base = kaggle_base_url()
+    if not base:
+        return
+    try:
+        resp = _post_json_with_retry(
+            f"{base}/chat/reset",
+            headers=kaggle_headers("application/json"),
+            json_body={},
+            timeout=POLL_TIMEOUT,
+            label="chat reset",
+        )
+        if resp.ok:
+            print(f"Kaggle chat reset: {resp.text[:200]}")
+        elif resp.status_code in (404, 405):
+            print("Kaggle /chat/reset not available on this server version")
+        else:
+            print(f"Kaggle chat reset failed ({resp.status_code}): {resp.text[:200]}")
+    except Exception as exc:
+        print(f"Kaggle chat reset error: {exc}")
+
+
+def _kaggle_start_chat_job(
+    messages: list[dict[str, str]],
+    *,
+    temperature: float,
+    deadline: float,
+) -> str | None:
+    """POST /chat until this client owns a started job. Returns job_id (may be None on old servers)."""
+    base = kaggle_base_url()
+    if not base:
+        raise RuntimeError("KAGGLE_API_BASE_URL is not set")
+
+    payload = {
+        "messages": messages,
+        "temperature": temperature,
+    }
+    busy_resets = 0
+
+    while time.time() < deadline:
+        try:
+            resp = _post_json_with_retry(
+                f"{base}/chat",
+                headers=kaggle_headers("application/json"),
+                json_body=payload,
+                timeout=POLL_TIMEOUT,
+                label="chat start",
+            )
+        except _RETRYABLE as exc:
+            print(f"Kaggle chat start failed ({exc}); will retry …")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        if resp.status_code == 404 or resp.status_code == 405:
+            raise RuntimeError(f"Kaggle /chat failed ({resp.status_code}): async chat unavailable")
+
+        if resp.status_code == 409:
+            # Hitting status triggers server-side stale-job expiry.
+            try:
+                status_resp = _get_with_retry(
+                    f"{base}/chat/status",
+                    headers=kaggle_headers(None),
+                    timeout=POLL_TIMEOUT,
+                    label="chat status",
+                )
+                if status_resp.ok:
+                    status_data = status_resp.json()
+                    age = status_data.get("age_seconds")
+                    print(
+                        f"Kaggle chat busy (409); status={status_data.get('status')}"
+                        f"{f', age={age}s' if age is not None else ''} — waiting …"
+                    )
+                    if status_data.get("status") == "error" and busy_resets < 2:
+                        busy_resets += 1
+                        _kaggle_reset_chat()
+                else:
+                    print("Kaggle chat busy (409); waiting to start …")
+            except Exception:
+                print("Kaggle chat busy (409); waiting to start …")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        if _is_retryable_http_status(resp.status_code):
+            print(f"Kaggle chat start got HTTP {resp.status_code}; will retry …")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        if not resp.ok:
+            detail = resp.text[:500]
+            raise RuntimeError(f"Kaggle /chat failed ({resp.status_code}): {detail}")
+
+        start_data = resp.json()
+        started = start_data.get("started")
+        # Defensive: older servers returned started=false while busy — treat as busy.
+        if started is False:
+            print("Kaggle chat start returned started=false; waiting to start …")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        job_id = start_data.get("job_id")
+        if isinstance(job_id, str) and job_id.strip():
+            print(f"Kaggle chat started (job_id={job_id})")
+            return job_id.strip()
+
+        print("Kaggle chat started (no job_id from server)")
+        return None
+
+    raise RuntimeError("Kaggle chat timed out waiting for a free chat slot to start")
 
 
 def _kaggle_chat_completions_async(
@@ -446,27 +579,14 @@ def _kaggle_chat_completions_async(
     if not base:
         raise RuntimeError("KAGGLE_API_BASE_URL is not set")
 
-    payload = {
-        "messages": messages,
-        "temperature": temperature,
-    }
-    resp = _post_json_with_retry(
-        f"{base}/chat",
-        headers=kaggle_headers("application/json"),
-        json_body=payload,
-        timeout=POLL_TIMEOUT,
-        label="chat start",
-    )
-    if not resp.ok:
-        detail = resp.text[:500]
-        raise RuntimeError(f"Kaggle /chat failed ({resp.status_code}): {detail}")
-
-    start_data = resp.json()
-    if start_data.get("status") == "complete":
-        return _extract_chat_content(_kaggle_fetch_chat_result(timeout=RESULT_TIMEOUT))
-
     deadline = time.time() + timeout
-    last_status = start_data.get("status", "unknown")
+    job_id = _kaggle_start_chat_job(
+        messages,
+        temperature=temperature,
+        deadline=deadline,
+    )
+
+    last_status = "running"
     while time.time() < deadline:
         try:
             status_resp = _get_with_retry(
@@ -480,6 +600,14 @@ def _kaggle_chat_completions_async(
             time.sleep(POLL_INTERVAL)
             continue
 
+        if _is_retryable_http_status(status_resp.status_code):
+            print(
+                f"Kaggle chat status HTTP {status_resp.status_code}; "
+                "treating as tunnel blip and retrying …"
+            )
+            time.sleep(POLL_INTERVAL)
+            continue
+
         if not status_resp.ok:
             detail = status_resp.text[:500]
             raise RuntimeError(
@@ -488,6 +616,16 @@ def _kaggle_chat_completions_async(
 
         status_data = status_resp.json()
         last_status = status_data.get("status", "unknown")
+        status_job_id = status_data.get("job_id")
+
+        if job_id and status_job_id and status_job_id != job_id:
+            print(
+                f"Kaggle chat status job_id mismatch "
+                f"(expected {job_id}, got {status_job_id}); waiting …"
+            )
+            time.sleep(POLL_INTERVAL)
+            continue
+
         if last_status == "complete":
             total_seconds = status_data.get("total_seconds")
             content_chars = status_data.get("content_chars")
@@ -497,13 +635,31 @@ def _kaggle_chat_completions_async(
                 f"{f' ({content_chars} chars)' if content_chars is not None else ''}"
                 " — fetching result …"
             )
-            return _extract_chat_content(_kaggle_fetch_chat_result(timeout=RESULT_TIMEOUT))
-        if last_status == "error":
-            raise RuntimeError(f"Kaggle chat failed: {status_data.get('error')}")
+            try:
+                return _extract_chat_content(
+                    _kaggle_fetch_chat_result(
+                        timeout=RESULT_TIMEOUT,
+                        expected_job_id=job_id,
+                    )
+                )
+            except RuntimeError as exc:
+                if "transient failure" in str(exc) or "job_id mismatch" in str(exc):
+                    print(f"Kaggle chat result not ready yet ({exc}); will retry …")
+                    time.sleep(POLL_INTERVAL)
+                    continue
+                raise
 
-        print(f"Kaggle chat running … (status={last_status})")
+        if last_status == "error":
+            error_detail = status_data.get("error")
+            _kaggle_reset_chat()
+            raise RuntimeError(f"Kaggle chat failed: {error_detail}")
+
+        age = status_data.get("age_seconds")
+        age_label = f", age={age}s" if age is not None else ""
+        print(f"Kaggle chat running … (status={last_status}{age_label})")
         time.sleep(POLL_INTERVAL)
 
+    _kaggle_reset_chat()
     raise RuntimeError(
         f"Kaggle chat timed out after {timeout}s (last status={last_status})"
     )
@@ -536,8 +692,12 @@ def kaggle_chat_completions(
         )
     except RuntimeError as exc:
         message = str(exc)
+        # Legacy servers only — never fall back to sync on 502/timeout/busy.
         if "Kaggle /chat failed (404)" in message or "Kaggle /chat failed (405)" in message:
-            print("Kaggle async /chat not available on server; trying sync /chat/completions …")
+            print(
+                "Kaggle async /chat not available on server; "
+                "falling back to sync /chat/completions (may hit tunnel 524) …"
+            )
         else:
             raise
 

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 INPUT_ROOT = Path("/kaggle/input")
@@ -92,6 +93,8 @@ API_SECRET = require_kaggle_secret(os.environ.get("KAGGLE_API_SECRET"))
 PORT = int(os.environ.get("CHAPTERWISE_GPU_PORT", "8766"))
 PDF_PATH = WORKING / "active_doc.pdf"
 UPLOAD_CHUNKS_DIR = WORKING / "upload_chunks"
+# If a chat job stays "running" longer than this, mark it error so the slot frees.
+CHAT_JOB_MAX_SECONDS = float(os.environ.get("CHAPTERWISE_CHAT_JOB_MAX_SECONDS", "120"))
 
 app = FastAPI(title="chapterwise Kaggle Extract Server")
 app.add_middleware(
@@ -117,6 +120,8 @@ _chat_job: dict[str, object] = {
     "status": "idle",
     "error": None,
     "result": None,
+    "job_id": None,
+    "started_at": None,
 }
 
 
@@ -141,16 +146,40 @@ def _reset_chat_job() -> None:
         _chat_job["status"] = "idle"
         _chat_job["error"] = None
         _chat_job["result"] = None
+        _chat_job["job_id"] = None
+        _chat_job["started_at"] = None
 
 
-def _format_chat_result(content: str, elapsed: float) -> dict:
+def _expire_stale_chat_job_locked() -> bool:
+    """If the current chat job exceeded CHAT_JOB_MAX_SECONDS, mark it error. Caller holds lock."""
+    if _chat_job["status"] != "running":
+        return False
+    started_at = _chat_job.get("started_at")
+    if not isinstance(started_at, (int, float)):
+        return False
+    age = time.time() - float(started_at)
+    if age < CHAT_JOB_MAX_SECONDS:
+        return False
+    job_id = _chat_job.get("job_id")
+    message = (
+        f"Chat job timed out after {round(age, 1)}s "
+        f"(limit={CHAT_JOB_MAX_SECONDS}s, job_id={job_id})"
+    )
+    print(f"chapterwise LLM: {message}")
+    _chat_job["status"] = "error"
+    _chat_job["error"] = message
+    _chat_job["result"] = None
+    return True
+
+
+def _format_chat_result(content: str, elapsed: float, job_id: str | None = None) -> dict:
     try:
         import llm_server
 
         model = llm_server.model_id()
     except Exception:
         model = os.environ.get("CHAPTERWISE_LLM_MODEL", "meta-llama/Llama-3.2-1B-Instruct")
-    return {
+    payload = {
         "id": "chapterwise-kaggle",
         "object": "chat.completion",
         "model": model,
@@ -163,30 +192,49 @@ def _format_chat_result(content: str, elapsed: float) -> dict:
         ],
         "timing": {"total_seconds": elapsed},
     }
+    if job_id:
+        payload["job_id"] = job_id
+    return payload
 
 
-def _run_chat_worker(messages: list[dict[str, str]], temperature: float) -> None:
+def _run_chat_worker(messages: list[dict[str, str]], temperature: float, job_id: str) -> None:
     started = time.perf_counter()
     try:
         import llm_server
     except ImportError:
         with _chat_lock:
-            _chat_job["status"] = "error"
-            _chat_job["error"] = "llm_server.py is not available on this Kaggle server."
-            _chat_job["result"] = None
+            if _chat_job.get("job_id") == job_id:
+                _chat_job["status"] = "error"
+                _chat_job["error"] = "llm_server.py is not available on this Kaggle server."
+                _chat_job["result"] = None
         return
 
     try:
+        print(f"chapterwise LLM: worker start job_id={job_id}")
         content = llm_server.generate_chat(messages, temperature=temperature)
         elapsed = round(time.perf_counter() - started, 2)
         print(f"chapterwise LLM chat complete in {elapsed}s ({len(content)} chars)")
         with _chat_lock:
+            if _chat_job.get("job_id") != job_id:
+                print(f"chapterwise LLM: dropping stale chat result for job {job_id}")
+                return
+            # Job may have been expired by watchdog while generate was finishing.
+            if _chat_job["status"] != "running":
+                print(
+                    f"chapterwise LLM: job {job_id} no longer running "
+                    f"(status={_chat_job['status']}); dropping late result"
+                )
+                return
             _chat_job["status"] = "complete"
             _chat_job["error"] = None
-            _chat_job["result"] = _format_chat_result(content, elapsed)
+            _chat_job["result"] = _format_chat_result(content, elapsed, job_id=job_id)
     except Exception as exc:
         print(f"chapterwise LLM chat failed: {exc}")
         with _chat_lock:
+            if _chat_job.get("job_id") != job_id:
+                return
+            if _chat_job["status"] != "running":
+                return
             _chat_job["status"] = "error"
             _chat_job["error"] = str(exc)
             _chat_job["result"] = None
@@ -194,20 +242,33 @@ def _run_chat_worker(messages: list[dict[str, str]], temperature: float) -> None
 
 def _start_chat_async(messages: list[dict[str, str]], temperature: float) -> dict:
     with _chat_lock:
+        _expire_stale_chat_job_locked()
         status = _chat_job["status"]
         if status == "running":
-            return {"ok": True, "status": "running", "started": False}
+            started_at = _chat_job.get("started_at")
+            age = (
+                round(time.time() - float(started_at), 1)
+                if isinstance(started_at, (int, float))
+                else None
+            )
+            detail = "Chat already running — poll GET /chat/status or retry later"
+            if age is not None:
+                detail = f"{detail} (age={age}s)"
+            raise HTTPException(status_code=409, detail=detail)
 
+        job_id = str(uuid.uuid4())
         _chat_job["status"] = "running"
         _chat_job["error"] = None
         _chat_job["result"] = None
+        _chat_job["job_id"] = job_id
+        _chat_job["started_at"] = time.time()
 
     threading.Thread(
         target=_run_chat_worker,
-        args=(messages, temperature),
+        args=(messages, temperature, job_id),
         daemon=True,
     ).start()
-    return {"ok": True, "status": "running", "started": True}
+    return {"ok": True, "status": "running", "started": True, "job_id": job_id}
 
 
 def _reset_extract_job() -> None:
@@ -536,11 +597,37 @@ def chat_start(body: ChatRequest, _: None = Depends(verify_token)) -> dict:
     return _start_chat_async(messages, body.temperature)
 
 
+@app.post("/chat/reset")
+def chat_reset(_: None = Depends(verify_token)) -> dict:
+    """Force-clear the chat job slot (use after a hung generate or laptop timeout)."""
+    with _chat_lock:
+        previous = {
+            "status": _chat_job["status"],
+            "job_id": _chat_job.get("job_id"),
+            "error": _chat_job.get("error"),
+        }
+        _chat_job["status"] = "idle"
+        _chat_job["error"] = None
+        _chat_job["result"] = None
+        _chat_job["job_id"] = None
+        _chat_job["started_at"] = None
+    print(f"chapterwise LLM: chat reset (was {previous})")
+    return {"ok": True, "reset": True, "previous": previous}
+
+
 @app.get("/chat/status")
 def chat_status(_: None = Depends(verify_token)) -> dict:
     with _chat_lock:
+        _expire_stale_chat_job_locked()
         status = _chat_job["status"]
         payload: dict[str, object] = {"ok": True, "status": status}
+        job_id = _chat_job.get("job_id")
+        if job_id:
+            payload["job_id"] = job_id
+        started_at = _chat_job.get("started_at")
+        if isinstance(started_at, (int, float)):
+            payload["age_seconds"] = round(time.time() - float(started_at), 1)
+            payload["max_seconds"] = CHAT_JOB_MAX_SECONDS
         if status == "error":
             payload["error"] = _chat_job["error"]
         elif status == "complete" and _chat_job["result"]:

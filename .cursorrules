@@ -10,7 +10,7 @@ Textbook PDF → ordered topics (chapters/sections/subsections) + per-topic expl
 
 1. User uploads a textbook PDF.
 2. Backend extracts text + images per page (local PyMuPDF + pdfplumber, or optional **Kaggle** remote extract via tunnel).
-3. **Kaggle Llama** or Azure OpenAI builds an **ordered** hierarchical topic tree (chapter → section → subsection) in document order.
+3. **Regex heading scan** (default) builds an **ordered** hierarchical topic tree (chapter → section → subsection) in document order. Optional legacy path: Kaggle Llama / Azure via `CHAPTERWISE_TOPIC_BUILDER=llm`.
 4. Each topic shows explanation, source page range, and formula/diagram images from those pages.
 5. User asks questions grounded in that topic’s text only.
 6. User presses Listen for OpenAI TTS narration.
@@ -24,7 +24,7 @@ Textbook PDF → ordered topics (chapters/sections/subsections) + per-topic expl
 | Step | Scope | Status |
 |------|--------|--------|
 | **1** | Backend `/upload_pdf` + `pdf_extract.py` (per-page text + images) | ✅ Done |
-| **2** | Backend `/build_topics` + `topic_builder.py` (ordered JSON tree via Kaggle Llama or Azure chat) | 🟡 Partial — Kaggle Llama works; JSON repair + OOM/tunnel fixes; tree quality still rough on noisy OCR |
+| **2** | Backend `/build_topics` + `topic_builder.py` (ordered tree; **regex default**, optional LLM) | 🟡 Partial — **regex TOC works** (~0.01s, no Llama); title/order still OCR-noisy on RapidOCR two-column text; LLM path kept behind `CHAPTERWISE_TOPIC_BUILDER=llm` |
 | **3** | Frontend `UploadPanel` + `TopicTree` wired to upload + build_topics | ✅ Done |
 | **4** | Backend `/topic/{id}` + Frontend `TopicView` (explanation + image gallery) | 🟡 Partial — LLM explanation + Listen on explanation ✅; image enhance pending |
 | **5** | Backend `/ask` + Frontend `AskPanel` (grounded Q&A) | ⬜ Not started |
@@ -47,7 +47,7 @@ chapterwise/
     azure_clients.py           ← Azure TTS/image clients + /debug/azure probes
     text_provider.py           ← TEXT_PROVIDER routing (Kaggle Llama / Azure chat)
     pdf_extract.py             ← Per-page text + image extraction
-    topic_builder.py           ← ordered topic tree via text_provider (Kaggle Llama / Azure)
+    topic_builder.py           ← ordered topic tree (regex headings default; optional LLM)
     topic_detail.py            ← Topic payload + LLM explanation via text_provider
     qa.py                      ← TODO step 5
     tts.py                     ← Azure TTS (step 6) ✅
@@ -97,7 +97,7 @@ chapterwise/
 |--------|------|---------|
 | GET | `/health` | Health check (+ Kaggle reachability, `text_provider`, LLM status) |
 | POST | `/upload_pdf` | Save PDF, extract pages; optional `?page_start=&page_end=`; returns `timing` (receive/extract/total seconds) |
-| POST | `/build_topics` | Send extracted text to text provider (Kaggle Llama / Azure) → topic tree; returns `timing.total_seconds` |
+| POST | `/build_topics` | Build topic tree (default: heading regex; optional LLM). Returns `builder`, `timing.total_seconds` |
 | GET | `/topic/{topic_id}` | Topic metadata, source text, LLM explanation, images |
 | POST | `/tts` | `{ text, voice? }` → MP3 audio |
 | GET | `/debug/text` | Smoke-test text provider (Kaggle Llama or Azure chat) |
@@ -157,16 +157,23 @@ chapterwise/
 
 ### Topic building (`topic_builder.py`)
 
-- **`TEXT_PROVIDER`:** `kaggle` | `azure` | `auto` — routed via `text_provider.py` → Kaggle `/chat/completions` or Azure chat
-- **Current default (laptop):** `TEXT_PROVIDER=kaggle` → **`meta-llama/Llama-3.2-1B-Instruct`** on Kaggle GPU
-- Chunks by page range — default from **`CHAPTERWISE_TOPIC_CHUNK_PAGES`** (laptop often **4** when fighting tunnel timeouts; was 8 / 18). `/build_topics` uses env default via `DEFAULT_CHUNK_PAGES`.
-- Strict JSON schema: `{ chapters: [{ title, page_start, page_end, sections: [...] }] }`
-- Chunks concatenated in order; IDs assigned (`ch1`, `ch1_s1`, `ch1_s1_ss1`, …)
-- `extract_topic_json()` + `_repair_topic_json_string()` repair malformed LLM JSON; `_call_topic_model()` retries once with “valid JSON only” follow-up (**assistant retry capped at 2000 chars** via `CHAPTERWISE_TOPIC_RETRY_CHARS`, was 12000)
-- Chat to Kaggle goes through **`kaggle_chat_completions()`** (async poll preferred) so long Llama runs do not hit Cloudflare **524**.
-- **Prompt rules (2026-08-10):** Activity boxes never become chapters/sections; hard limits (≤4 sections, ≤3 subsections per chunk); placeholder worked example + `_ANTI_LEAK_SENTENCE`; copy numbered headings from source; empty subsections when no real subheading/Activity.
-- **Sanity warnings:** `_warn_chunk_tree_sanity()` — too many chapters, Activity in titles, prompt leakage, sibling near-duplicate titles.
-- Optional body on `/build_topics`: `{ page_start, page_end, chunk_pages }` for testing a single chapter
+- **`CHAPTERWISE_TOPIC_BUILDER`:** `regex` (default) | `llm`
+- **Regex path (Plan B, 2026-08-12):** Scan extracted page text for NCERT-style headings — `Chapter N` / OCR `hapterC`, `N.N Title`, `N.N.N TITLE`, `Activity N.N` (incl. OCR stutter `1.31.31.3` → `1.3`). **No Llama call.** Build ~0.01s on pages 1–8.
+- **Body coverage (approach a):** Non-heading text is not dropped — each heading’s `page_start`/`page_end` spans until the next heading so `/topic` source slices include intervening body. First heading expands back to range start; last to range end.
+- **Fallback (approach b):** If a page range has **zero** heading matches → one chapter node `Pages {start}–{end}` covering the whole range.
+- **IDs:** `ch1`, `ch1_s1`, `ch1_s1_ss1`, … via `assign_topic_ids` / `flatten_topics` (same as before).
+- **`/build_topics` response** includes `builder` (`regex`|`llm`) and optional `heading_count`.
+- **Known regex limits (defer vs fix):** (1) `_SECTION_RE` title group can eat across column gaps (`Physical Nature of Matter of sa`); (2) headings glued mid-line truncate (`…glass1.2 Characteristics of Particles of`); (3) RapidOCR text is **not** column-aware reading order — e.g. page 6 emits `1.4.1 EFFECT` before `1.4 Can Matter…`, so tree order follows OCR stream.
+- **LLM path (legacy):** `CHAPTERWISE_TOPIC_BUILDER=llm` — chunk by `CHAPTERWISE_TOPIC_CHUNK_PAGES`, Kaggle/Azure chat, JSON repair + retry. Large topic prompts (~12k chars) hang on Kaggle Llama 1B; tiny/medium chats (~2s) are fine.
+- Optional body on `/build_topics`: `{ page_start, page_end, chunk_pages }` (`chunk_pages` only matters for `llm`)
+
+### Kaggle chat reliability (2026-08-12)
+
+- Busy chat → **HTTP 409** (not `started:false`); each job has **`job_id`**
+- Laptop polls/retries on 409; treats **502/503/524** as tunnel blips; sync `/chat/completions` fallback **only** on 404/405
+- Generate: `max_time` + **time StoppingCriteria** (~90s); job watchdog **`CHAPTERWISE_CHAT_JOB_MAX_SECONDS`** (default 120); **`POST /chat/reset`**
+- Notebook cell 2 defaults: `MAX_NEW_TOKENS=512`, `MAX_TIME_SECONDS=90`, `CHAT_JOB_MAX_SECONDS=120`
+- Republish `eakeswar/chapterwise-models` after server/llm_server changes; refresh tunnel URL each notebook session
 
 ---
 
@@ -229,6 +236,8 @@ cd frontend && npm install
 - **2026-08-10 — Topic build OOM + tunnel 502:** Llama 1B on T4 OOM during `/chat/completions` when prompt + `max_new_tokens=4096` spiked attention (~13 GB). Pattern: first call often succeeds; **JSON retry** (bad output + full chunk) triggers CUDA OOM or Cloudflare **502 Bad gateway** (tunnel loses Kaggle mid-request). Fixes: `llm_server.py` — defaults `MAX_NEW_TOKENS=1024`, `MAX_INPUT_CHARS=12000`, truncate **all** messages to total budget, assistant cap 2000, `empty_cache()` after generate, `repetition_penalty=1.2`. `topic_builder.py` — retry assistant capped at `CHAPTERWISE_TOPIC_RETRY_CHARS=2000`. `main.py` — `/build_topics` uses `CHAPTERWISE_TOPIC_CHUNK_PAGES` from env (not hardcoded 18). Republished `eakeswar/chapterwise-models`. Topic prompt tightened (Activity rules, section limits, anti-leak example); sanity warnings for bad trees. Tree quality on Class 9 Science OCR still rough (fabricated subsections, parallel “chapters” for 1.1/1.2).
 - **2026-08-11 — Kaggle secrets + HF auth:** Notebook cell 2 loads **`KAGGLE_API_SECRET`** and **`HF_TOKEN`** via `UserSecretsClient` (Add-ons → Secrets). Missing `HF_TOKEN` secret caused 401 gated-repo (not HF permissions). Missing/mismatched `KAGGLE_API_SECRET` caused laptop `401 Invalid or missing API token` on `/chat/completions` while `/health` still looked fine. `llm_server` prints `HF auth token present/len` before load; uses `token=` + `huggingface_hub.login`.
 - **2026-08-11 — Async chat (tunnel 524):** Sync `/chat/completions` often exceeded Cloudflare free-tunnel ~100s → **524 A timeout occurred** even when Llama finished on Kaggle. Added Kaggle `POST /chat` + `GET /chat/status` + `GET /chat/result`; laptop `kaggle_client.kaggle_chat_completions()` polls like extract. Republished dataset. Prefer **Test first pages only = 8** and `CHAPTERWISE_TOPIC_CHUNK_PAGES=4` while validating. End-to-end build still needs user confirmation after attaching latest dataset version.
+- **2026-08-12 — Kaggle chat reliability (Plan A):** Busy chat → 409 + `job_id`; client retries 409/502; no sync fallback except 404/405; generate `max_time` + StoppingCriteria; chat job watchdog + `/chat/reset`. Topic-sized Llama prompts (~12.5k chars) still hang on T4; tiny/medium chats OK (~2s).
+- **2026-08-12 — Regex topic builder (Plan B):** Default `CHAPTERWISE_TOPIC_BUILDER=regex` — heading regex TOC, no Llama. Body text kept via page ranges (approach a); empty-range fallback chapter (approach b). Pages 1–8 Class 9 Science: ~21 topics in 0.01s. OCR title spill / two-column order issues documented; fix deferred pending user decision. LLM path: `CHAPTERWISE_TOPIC_BUILDER=llm`.
 
 ---
 
@@ -239,6 +248,7 @@ Azure OpenAI uses **Foundry v1 API** — `OpenAI` class with `base_url` + `api_k
 ```env
 AZURE_OPENAI_API_KEY=...
 TEXT_PROVIDER=kaggle
+CHAPTERWISE_TOPIC_BUILDER=regex
 CHAPTERWISE_LLM_TIMEOUT=600
 
 # Azure chat (when TEXT_PROVIDER=azure or auto fallback)
@@ -369,6 +379,6 @@ Frontend `.env` optional: `VITE_API_BASE_URL=http://127.0.0.1:8766`
 
 ## 12. Next step when user says “continue”
 
-**Next:** (1) Confirm end-to-end with latest dataset (async `/chat`): upload Test first pages only (8) → build topics → tree → topic → explanation + Listen. (2) **Step 5:** `qa.py` + `/ask` + `AskPanel`. (3) Step 7 image routing incrementally. (4) `# TODO v2`: skip Kaggle upload when page range set; background extract; disk cache.
+**Next:** (1) Decide whether to tighten regex title boundaries / column reading order (deferred). (2) End-to-end: regex build → open topic → explanation + Listen (explanation still uses Kaggle Llama — keep prompts small). (3) **Step 5:** `qa.py` + `/ask` + `AskPanel`. (4) Step 7 image routing. (5) `# TODO v2`: skip Kaggle upload when page range set; background extract; disk cache.
 
-**Dev defaults (2026-08-11):** `EXTRACT_PROVIDER=local`, `TEXT_PROVIDER=kaggle`, `CHAPTERWISE_TOPIC_CHUNK_PAGES=4`, `CHAPTERWISE_TEXT_EXTRACTOR=rapidocr`. Kaggle notebook cell 2 secrets: `KAGGLE_API_SECRET`, `HF_TOKEN`; env: `CHAPTERWISE_LLM_PRELOAD=1`, `CHAPTERWISE_LLM_4BIT=1`, `CHAPTERWISE_LLM_MAX_INPUT_CHARS=12000`, `CHAPTERWISE_LLM_MAX_NEW_TOKENS=1024`.
+**Dev defaults (2026-08-12):** `EXTRACT_PROVIDER=local`, `CHAPTERWISE_TOPIC_BUILDER=regex`, `TEXT_PROVIDER=kaggle` (explanations/Q&A), `CHAPTERWISE_TEXT_EXTRACTOR=rapidocr`. Kaggle still needed for topic **explanations**, not for TOC. Notebook LLM defaults: `MAX_NEW_TOKENS=512`, `MAX_TIME_SECONDS=90`, `CHAT_JOB_MAX_SECONDS=120`.
