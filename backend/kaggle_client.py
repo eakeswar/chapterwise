@@ -507,9 +507,10 @@ def _kaggle_start_chat_job(
                 label="chat start",
             )
         except _RETRYABLE as exc:
-            print(f"Kaggle chat start failed ({exc}); will retry …")
-            time.sleep(POLL_INTERVAL)
-            continue
+            # Inner helper already retried (DNS / connection / SSL). Do not spin
+            # until CHAPTERWISE_LLM_TIMEOUT — that blocks GET /topic while Kaggle is down.
+            print(f"Kaggle chat start failed after retries ({exc})")
+            raise RuntimeError(f"Kaggle chat unreachable: {exc}") from exc
 
         if resp.status_code == 404 or resp.status_code == 405:
             raise RuntimeError(f"Kaggle /chat failed ({resp.status_code}): async chat unavailable")

@@ -44,8 +44,8 @@ chapterwise/
   .gitignore
   backend/
     main.py                    ← FastAPI app
-    azure_clients.py           ← Azure TTS/image clients + /debug/azure probes
-    text_provider.py           ← TEXT_PROVIDER routing (Kaggle Llama / Azure chat)
+    azure_clients.py           ← Azure chat + TTS/image clients (separate keys) + /debug/azure
+    text_provider.py           ← TEXT_PROVIDER routing (Azure chat / Kaggle Llama)
     pdf_extract.py             ← Per-page text + image extraction
     topic_builder.py           ← ordered topic tree (regex headings default; optional LLM)
     topic_detail.py            ← Topic payload + LLM explanation via text_provider
@@ -171,6 +171,7 @@ chapterwise/
 
 - Busy chat → **HTTP 409** (not `started:false`); each job has **`job_id`**
 - Laptop polls/retries on 409; treats **502/503/524** as tunnel blips; sync `/chat/completions` fallback **only** on 404/405
+- **Dead tunnel / DNS:** do **not** retry connection errors until `CHAPTERWISE_LLM_TIMEOUT` — raise after inner retries so `/topic` can return `explanation_status=failed` with source text
 - Generate: `max_time` + **time StoppingCriteria** (~90s); job watchdog **`CHAPTERWISE_CHAT_JOB_MAX_SECONDS`** (default 120); **`POST /chat/reset`**
 - Notebook cell 2 defaults: `MAX_NEW_TOKENS=512`, `MAX_TIME_SECONDS=90`, `CHAT_JOB_MAX_SECONDS=120`
 - Republish `eakeswar/chapterwise-models` after server/llm_server changes; refresh tunnel URL each notebook session
@@ -238,6 +239,10 @@ cd frontend && npm install
 - **2026-08-11 — Async chat (tunnel 524):** Sync `/chat/completions` often exceeded Cloudflare free-tunnel ~100s → **524 A timeout occurred** even when Llama finished on Kaggle. Added Kaggle `POST /chat` + `GET /chat/status` + `GET /chat/result`; laptop `kaggle_client.kaggle_chat_completions()` polls like extract. Republished dataset. Prefer **Test first pages only = 8** and `CHAPTERWISE_TOPIC_CHUNK_PAGES=4` while validating. End-to-end build still needs user confirmation after attaching latest dataset version.
 - **2026-08-12 — Kaggle chat reliability (Plan A):** Busy chat → 409 + `job_id`; client retries 409/502; no sync fallback except 404/405; generate `max_time` + StoppingCriteria; chat job watchdog + `/chat/reset`. Topic-sized Llama prompts (~12.5k chars) still hang on T4; tiny/medium chats OK (~2s).
 - **2026-08-12 — Regex topic builder (Plan B):** Default `CHAPTERWISE_TOPIC_BUILDER=regex` — heading regex TOC, no Llama. Body text kept via page ranges (approach a); empty-range fallback chapter (approach b). Pages 1–8 Class 9 Science: ~21 topics in 0.01s. OCR title spill / two-column order issues documented; fix deferred pending user decision. LLM path: `CHAPTERWISE_TOPIC_BUILDER=llm`.
+- **2026-08-13 — Regex TOC confirmed live:** `CHAPTERWISE_TOPIC_BUILDER` is often **unset** in `.env` (code default `regex`, not leftover `llm`). Pages 1–8 Class 9 Science: `POST /build_topics` → HTTP 200, `builder=regex`, `heading_count=20`, `topic_count=21` in ~0s. `GET /debug/topics` populated. OCR title spill still present (`Matter of sa`, truncated titles, `1.4.1 EFFECT` before `1.4`).
+- **2026-08-13 — Dead Kaggle must not block `/topic`:** With `TEXT_PROVIDER=kaggle` and a dead tunnel, `GET /topic/{id}` hung until `CHAPTERWISE_LLM_TIMEOUT` (600s) because `_kaggle_start_chat_job` retried DNS/connection errors in a loop. **Fix:** after `_post_json_with_retry` exhausts retries, raise `Kaggle chat unreachable` immediately. `topic_detail` still returns HTTP 200 with `explanation_status=failed`, source text + images (~3s). UI already shows the failed-explanation notice.
+- **2026-08-13 — Azure chat on a separate resource:** New Foundry resource `chapterwise-text` (user’s account). Chat uses **`AZURE_CHAT_API_KEY`** + **`AZURE_CHAT_BASE_URL`** (must include `/openai/v1`). TTS/images keep `AZURE_OPENAI_API_KEY` + services endpoint. Laptop `TEXT_PROVIDER=azure`, `AZURE_TEXT_DEPLOYMENT=gpt-4.1-mini`. Missing `/openai/v1` on the chat URL → 404 Resource not found.
+- **2026-08-13 — Extract/TOC stay local:** Kaggle T4 GPUs run **Llama only**; PyMuPDF/RapidOCR + regex TOC are CPU. Do not move extract or regex tree to Kaggle to “use the 2 GPUs.” Optional later: Kaggle CPU extract + regex colocation to avoid pulling full extract JSON through the tunnel (`topic_builder.py` is not in the Kaggle dataset bundle yet).
 
 ---
 
@@ -246,19 +251,21 @@ cd frontend && npm install
 Azure OpenAI uses **Foundry v1 API** — `OpenAI` class with `base_url` + `api_key`; pass **deployment name** as `model=`. Do **not** use `AzureOpenAI` with `api_version`.
 
 ```env
+# TTS + images (edzhub / services endpoint)
 AZURE_OPENAI_API_KEY=...
-TEXT_PROVIDER=kaggle
-CHAPTERWISE_TOPIC_BUILDER=regex
-CHAPTERWISE_LLM_TIMEOUT=600
-
-# Azure chat (when TEXT_PROVIDER=azure or auto fallback)
-AZURE_OPENAI_BASE_URL=https://edzhub-resource.openai.azure.com/openai/v1
-AZURE_TEXT_DEPLOYMENT=gpt-4o-mini
 AZURE_SERVICES_BASE_URL=https://edzhub-resource.services.ai.azure.com/openai/v1
 AZURE_TTS_BASE_URL=https://edzhub-resource.services.ai.azure.com/openai/v1
 AZURE_TTS_DEPLOYMENT=gpt-4o-mini-tts
 AZURE_IMAGES_BASE_URL=https://edzhub-resource.services.ai.azure.com/openai/v1
 AZURE_IMAGE_DEPLOYMENT=gpt-image-2
+
+# Chat — separate resource (chapterwise-text); do not reuse TTS/image key
+TEXT_PROVIDER=azure
+AZURE_CHAT_API_KEY=...
+AZURE_CHAT_BASE_URL=https://YOUR-RESOURCE.openai.azure.com/openai/v1
+AZURE_TEXT_DEPLOYMENT=gpt-4.1-mini
+CHAPTERWISE_TOPIC_BUILDER=regex
+CHAPTERWISE_LLM_TIMEOUT=600
 
 CHAPTERWISE_CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
 CHAPTERWISE_TOPIC_CHUNK_PAGES=4
@@ -305,7 +312,7 @@ Frontend `.env` optional: `VITE_API_BASE_URL=http://127.0.0.1:8766`
 
 ## 8. Explicit non-goals for v1 (flag as `# TODO v2`)
 
-- No **Azure** chat fallback when `TEXT_PROVIDER=kaggle` — Kaggle Llama handles topic text; TTS/images stay on Azure
+- No **Azure** chat fallback when `TEXT_PROVIDER=kaggle` — if Kaggle text is selected, do not silently use the TTS/image key for chat. Current default is `TEXT_PROVIDER=azure` (separate `AZURE_CHAT_*` creds); TTS/images stay on the edzhub services endpoint.
 - No karaoke word highlighting — play/pause audio per topic only
 - No image **generation** for formula/diagram images — Lanczos upscale only for informational images; `gpt-image-2` only for small/blurry **decorative** images (step 7)
 - No multi-user auth — single active document
@@ -361,9 +368,9 @@ Frontend `.env` optional: `VITE_API_BASE_URL=http://127.0.0.1:8766`
 
 ## 11. Known issues & ops
 
-- **Text/chat:** `TEXT_PROVIDER=kaggle` uses Kaggle async `/chat` (poll) when available, else sync `/chat/completions`. `auto` falls back to Azure if Kaggle text fails. Verify with `GET /debug/text` (`llm_loaded: true` on Kaggle health when preloaded).
-- **Azure chat (optional):** Only required when `TEXT_PROVIDER=azure` or as auto fallback. TTS and images still use `services.ai.azure.com`. Verify TTS/images with `GET /debug/azure`. **`gpt-4o-mini` chat deployment still not provisioned** on `edzhub-resource`.
-- **Azure endpoints:** Text chat → `AZURE_OPENAI_BASE_URL`; TTS + images → `AZURE_TTS_BASE_URL` / `AZURE_IMAGES_BASE_URL` (services endpoint, must include `/openai/v1`).
+- **Text/chat:** Default `TEXT_PROVIDER=azure` uses `AZURE_CHAT_API_KEY` + `AZURE_CHAT_BASE_URL` + `AZURE_TEXT_DEPLOYMENT=gpt-4.1-mini`. Verify with `GET /debug/text`. `TEXT_PROVIDER=kaggle` uses Kaggle async `/chat` (poll); `auto` falls back to Azure if Kaggle text fails. Dead Kaggle must fail fast (not spin until `CHAPTERWISE_LLM_TIMEOUT`) so `/topic` still returns source + images.
+- **Azure TTS/images:** Still `AZURE_OPENAI_API_KEY` on `services.ai.azure.com`. Verify with `GET /debug/azure`. Do not send chat requests with the TTS/image key.
+- **Azure chat URL:** `AZURE_CHAT_BASE_URL` **must include `/openai/v1`**. Host-only URL → 404 Resource not found. Restart backend after `.env` edits.
 - **Kaggle tunnel:** Free `trycloudflare.com` URLs are ephemeral — refresh `KAGGLE_API_BASE_URL` each notebook run. **`/health` is fast and unauthenticated**. Long sync `/chat/completions` can fail with **524** (timeout) or **502**; use async `/chat` polling on latest dataset. `KAGGLE_API_SECRET` must **exactly match** notebook UserSecrets (placeholder/`PASTE_…` → 401 on chat). Prefer **`EXTRACT_PROVIDER=local`** for fast dev; use `auto` or `kaggle` for full offloaded extract.
 - **Kaggle Llama gated model:** Accept license on https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct (“Expand to review and access”); set `HF_TOKEN` via Kaggle Add-ons → Secrets. 401 with `present=False` → secret not loaded; 401 with `present=True` → HF access not granted for that token’s account.
 - **Kaggle Llama runtime:** Use `CHAPTERWISE_LLM_PRELOAD=1`. CUDA OOM on T4 → `CHAPTERWISE_TOPIC_CHUNK_PAGES=4` or `8`, `CHAPTERWISE_LLM_MAX_INPUT_CHARS=12000`, `CHAPTERWISE_LLM_MAX_NEW_TOKENS=1024`, republish dataset after `llm_server.py` / `chapterwise_gpu_server.py` changes. Llama 1B may return malformed topic JSON → repair + retry in `topic_builder.py` (retry assistant capped at 2000 chars).
@@ -379,6 +386,6 @@ Frontend `.env` optional: `VITE_API_BASE_URL=http://127.0.0.1:8766`
 
 ## 12. Next step when user says “continue”
 
-**Next:** (1) Decide whether to tighten regex title boundaries / column reading order (deferred). (2) End-to-end: regex build → open topic → explanation + Listen (explanation still uses Kaggle Llama — keep prompts small). (3) **Step 5:** `qa.py` + `/ask` + `AskPanel`. (4) Step 7 image routing. (5) `# TODO v2`: skip Kaggle upload when page range set; background extract; disk cache.
+**Next:** (1) Smoke-test Azure explanations: regex build → open topic → `explanation_status=ready` + Listen (restart backend after chat URL/`/openai/v1` edits). (2) Decide whether to tighten regex title boundaries / column reading order (deferred). (3) **Step 5:** `qa.py` + `/ask` + `AskPanel`. (4) Step 7 image routing. (5) `# TODO v2`: skip Kaggle upload when page range set; background extract; disk cache; optional Kaggle CPU extract+regex without Llama.
 
-**Dev defaults (2026-08-12):** `EXTRACT_PROVIDER=local`, `CHAPTERWISE_TOPIC_BUILDER=regex`, `TEXT_PROVIDER=kaggle` (explanations/Q&A), `CHAPTERWISE_TEXT_EXTRACTOR=rapidocr`. Kaggle still needed for topic **explanations**, not for TOC. Notebook LLM defaults: `MAX_NEW_TOKENS=512`, `MAX_TIME_SECONDS=90`, `CHAT_JOB_MAX_SECONDS=120`.
+**Dev defaults (2026-08-13):** `EXTRACT_PROVIDER=local`, `CHAPTERWISE_TOPIC_BUILDER=regex` (unset in `.env` is OK), `TEXT_PROVIDER=azure` (`gpt-4.1-mini` via `AZURE_CHAT_*`), `CHAPTERWISE_TEXT_EXTRACTOR=rapidocr`. Kaggle is optional (extract offload / legacy Llama); not required for TOC or explanations. Notebook LLM defaults if used: `MAX_NEW_TOKENS=512`, `MAX_TIME_SECONDS=90`, `CHAT_JOB_MAX_SECONDS=120`.

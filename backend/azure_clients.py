@@ -29,8 +29,12 @@ def get_api_key() -> str:
     return _require_env("AZURE_OPENAI_API_KEY")
 
 
+def get_chat_api_key() -> str:
+    return _require_env("AZURE_CHAT_API_KEY")
+
+
 def get_text_base_url() -> str:
-    return _optional_env("AZURE_TEXT_BASE_URL", "AZURE_OPENAI_BASE_URL")
+    return _require_env("AZURE_CHAT_BASE_URL")
 
 
 def get_tts_base_url() -> str:
@@ -65,7 +69,7 @@ def get_image_deployment() -> str:
 def get_text_client():
     from openai import OpenAI
 
-    return OpenAI(api_key=get_api_key(), base_url=get_text_base_url())
+    return OpenAI(api_key=get_chat_api_key(), base_url=get_text_base_url())
 
 
 def get_tts_client():
