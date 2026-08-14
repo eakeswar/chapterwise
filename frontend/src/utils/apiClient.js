@@ -53,6 +53,18 @@ export async function fetchTopic(topicId) {
   return response.json()
 }
 
+export async function askQuestion(topicId, question) {
+  const response = await fetch(API.ask, {
+    method: 'POST',
+    headers: apiHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ topic_id: topicId, question }),
+  })
+  if (!response.ok) {
+    throw new Error(await parseError(response))
+  }
+  return response.json()
+}
+
 export async function synthesizeSpeech(text) {
   const response = await fetch(API.tts, {
     method: 'POST',

@@ -2,14 +2,32 @@
 
 from __future__ import annotations
 
+import threading
+from pathlib import Path
 from typing import Any
+
+import fitz
+
+from pdf_extract import encode_xref_data_url
 
 _EXPLANATION_CACHE: dict[str, str] = {}
 _EXPLANATION_SOURCE_CHAR_LIMIT = 28000
 
+# data URLs for deferred images: "{pdf fingerprint}:{xref}" -> (ext, url)
+_IMAGE_URL_CACHE: dict[str, tuple[str, str]] = {}
+_IMAGE_URL_CACHE_LOCK = threading.Lock()
+_BACKEND_DIR = Path(__file__).resolve().parent
+_ACTIVE_PDF_FALLBACK = _BACKEND_DIR / "active_doc.pdf"
+
 
 def clear_explanation_cache() -> None:
     _EXPLANATION_CACHE.clear()
+    with _IMAGE_URL_CACHE_LOCK:
+        _IMAGE_URL_CACHE.clear()
+
+
+def get_cached_explanation(topic_id: str) -> str | None:
+    return _EXPLANATION_CACHE.get(topic_id)
 
 
 def _pages_in_range(
@@ -28,10 +46,94 @@ def _compose_source_text(pages: list[dict[str, Any]]) -> str:
     return "\n\n".join(parts).strip()
 
 
-def _serialize_topic_images(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _resolve_pdf_path(extraction: dict[str, Any]) -> Path | None:
+    raw = extraction.get("pdf_path")
+    if raw:
+        candidate = Path(raw)
+        if candidate.is_file():
+            return candidate
+    if _ACTIVE_PDF_FALLBACK.is_file():
+        return _ACTIVE_PDF_FALLBACK
+    return None
+
+
+def _pdf_fingerprint(pdf_path: Path) -> str:
+    try:
+        stat = pdf_path.stat()
+        return f"{pdf_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
+    except OSError:
+        return str(pdf_path)
+
+
+def _image_cache_key(fingerprint: str, xref: int) -> str:
+    return f"{fingerprint}:{xref}"
+
+
+def _hydrate_deferred_image_urls(
+    pdf_path: Path,
+    images: list[dict[str, Any]],
+) -> None:
+    fingerprint = _pdf_fingerprint(pdf_path)
+    missing_xrefs: list[int] = []
+    seen: set[int] = set()
+    with _IMAGE_URL_CACHE_LOCK:
+        for image in images:
+            if image.get("url"):
+                continue
+            xref = image.get("xref")
+            if xref is None:
+                continue
+            xref_int = int(xref)
+            cached = _IMAGE_URL_CACHE.get(_image_cache_key(fingerprint, xref_int))
+            if cached:
+                image["ext"] = cached[0]
+                image["url"] = cached[1]
+                continue
+            if xref_int not in seen:
+                seen.add(xref_int)
+                missing_xrefs.append(xref_int)
+
+    if not missing_xrefs:
+        return
+
+    encoded: dict[int, tuple[str, str]] = {}
+    doc = fitz.open(pdf_path)
+    try:
+        for xref in missing_xrefs:
+            result = encode_xref_data_url(doc, xref)
+            if result is None:
+                continue
+            encoded[xref] = result
+    finally:
+        doc.close()
+
+    if not encoded:
+        return
+
+    with _IMAGE_URL_CACHE_LOCK:
+        for xref, payload in encoded.items():
+            _IMAGE_URL_CACHE[_image_cache_key(fingerprint, xref)] = payload
+        for image in images:
+            if image.get("url"):
+                continue
+            xref = image.get("xref")
+            if xref is None:
+                continue
+            cached = _IMAGE_URL_CACHE.get(_image_cache_key(fingerprint, int(xref)))
+            if cached:
+                image["ext"] = cached[0]
+                image["url"] = cached[1]
+
+
+def _serialize_topic_images(
+    pages: list[dict[str, Any]],
+    pdf_path: Path | None,
+) -> list[dict[str, Any]]:
     images: list[dict[str, Any]] = []
     for page in pages:
         for image in page.get("images") or []:
+            if image.get("isBackground"):
+                continue
             images.append(
                 {
                     "id": image["id"],
@@ -39,11 +141,14 @@ def _serialize_topic_images(pages: list[dict[str, Any]]) -> list[dict[str, Any]]
                     "w": image["w"],
                     "h": image["h"],
                     "ext": image["ext"],
+                    "xref": image.get("xref"),
                     "isBackground": image.get("isBackground", False),
                     "overlapWordCount": image.get("overlapWordCount", 0),
                     "url": image.get("url"),
                 }
             )
+    if pdf_path is not None:
+        _hydrate_deferred_image_urls(pdf_path, images)
     return images
 
 
@@ -135,7 +240,7 @@ def build_topic_detail(
     page_end = int(topic["page_end"])
     pages = _pages_in_range(extraction["pages"], page_start, page_end)
     source_text = _compose_source_text(pages)
-    images = _serialize_topic_images(pages)
+    images = _serialize_topic_images(pages, _resolve_pdf_path(extraction))
 
     explanation, explanation_status, explanation_error = _generate_explanation(
         topic_id,

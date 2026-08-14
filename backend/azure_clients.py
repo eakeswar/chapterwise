@@ -122,7 +122,7 @@ def probe_azure_service(kind: AzureServiceKind) -> dict[str, Any]:
             client = get_tts_client()
             response = client.audio.speech.create(
                 model=deployment,
-                voice="alloy",
+                voice="shimmer",
                 input="Azure TTS test.",
                 response_format="mp3",
             )

@@ -392,6 +392,28 @@ input {
   line-height: 1.65;
 }
 
+.ask-panel .ask-input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0 0 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #fff;
+  font: inherit;
+  resize: vertical;
+  min-height: 72px;
+}
+
+.ask-panel .secondary-button {
+  margin-bottom: 12px;
+}
+
+.ask-answer {
+  margin-top: 4px;
+}
+
 .topic-source {
   margin: 0;
   padding: 16px;

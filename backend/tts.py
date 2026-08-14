@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from azure_clients import get_tts_client, get_tts_deployment
 
-DEFAULT_VOICE = "alloy"
+DEFAULT_VOICE = "shimmer"
 MAX_TTS_CHARS = 4096
 
 

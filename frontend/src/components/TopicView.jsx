@@ -3,6 +3,7 @@ import { findTopicById, useDoc } from '../context/DocContext'
 import { fetchTopic, synthesizeSpeech } from '../utils/apiClient'
 import TopicViewSkeleton from './TopicViewSkeleton'
 import Skeleton from './Skeleton'
+import AskPanel from './AskPanel'
 
 const TTS_CHAR_LIMIT = 3800
 
@@ -188,6 +189,8 @@ export default function TopicView() {
                 <p className="topic-view-muted">No source text to explain for this page range.</p>
               ) : null}
             </section>
+
+            <AskPanel topicId={state.activeTopicId} />
 
             <section className="topic-section">
               <h2>Source text</h2>

@@ -23,6 +23,39 @@ except ImportError:
     _PDFPLUMBER_IMPORTED = False
 
 MIN_IMAGE_DIM = 50
+# Browsers cannot paint JPEG2000/JBIG2 data URLs; convert those to PNG.
+_BROWSER_UNSAFE_IMAGE_EXTS = frozenset({"jpx", "jp2", "j2k", "jxr", "jb2"})
+
+
+def encode_xref_data_url(doc: fitz.Document, xref: int) -> tuple[str, str] | None:
+    """Return (ext, data URL) for an image xref, or None if extract fails."""
+    try:
+        img_dict = doc.extract_image(xref)
+    except Exception:
+        return None
+    image_bytes = img_dict.get("image")
+    if not image_bytes:
+        return None
+    ext = str(img_dict.get("ext") or "png").lower()
+    if ext in _BROWSER_UNSAFE_IMAGE_EXTS:
+        converted = _xref_to_png_bytes(doc, xref)
+        if converted:
+            image_bytes = converted
+            ext = "png"
+    data_url = f"data:image/{ext};base64,{base64.b64encode(image_bytes).decode('utf-8')}"
+    return ext, data_url
+
+
+def _xref_to_png_bytes(doc: fitz.Document, xref: int) -> bytes | None:
+    try:
+        pix = fitz.Pixmap(doc, xref)
+        try:
+            return pix.tobytes("png")
+        except Exception:
+            pix = fitz.Pixmap(fitz.csRGB, pix)
+            return pix.tobytes("png")
+    except Exception:
+        return None
 
 
 def defer_image_b64() -> bool:
@@ -400,20 +433,12 @@ def _extract_page_images(
                 images.append(image_entry)
                 break
 
-            try:
-                img_dict = doc.extract_image(xref)
-            except Exception:
+            encoded = encode_xref_data_url(doc, xref)
+            if encoded is None:
                 continue
-
-            image_bytes = img_dict.get("image")
-            if not image_bytes:
-                continue
-
-            ext = img_dict.get("ext", "png")
+            ext, data_url = encoded
             image_entry["ext"] = ext
-            image_entry["url"] = (
-                f"data:image/{ext};base64,{base64.b64encode(image_bytes).decode('utf-8')}"
-            )
+            image_entry["url"] = data_url
             images.append(image_entry)
             break
 
@@ -492,25 +517,32 @@ def _get_rapidocr_pdf() -> Any:
     global _RAPIDOCR_PDF
     if _RAPIDOCR_PDF is not None:
         return _RAPIDOCR_PDF
-    try:
-        from rapidocr_pdf import RapidOCRPDF
-    except ImportError as exc:
-        raise RuntimeError(
-            "CHAPTERWISE_TEXT_EXTRACTOR=rapidocr but rapidocr-pdf is not installed. "
-            "Run: python -m pip install --target backend/vendor rapidocr-pdf"
-        ) from exc
+    with _RAPIDOCR_LOCK:
+        if _RAPIDOCR_PDF is not None:
+            return _RAPIDOCR_PDF
+        try:
+            from rapidocr_pdf import RapidOCRPDF
+        except ImportError as exc:
+            raise RuntimeError(
+                "CHAPTERWISE_TEXT_EXTRACTOR=rapidocr but rapidocr-pdf is not installed. "
+                "Run: python -m pip install --target backend/vendor rapidocr-pdf"
+            ) from exc
 
-    ocr_params: dict[str, Any] = {}
-    if os.environ.get("CHAPTERWISE_RAPIDOCR_TORCH", "0").strip().lower() in ("1", "true", "yes"):
-        ocr_params["Global.with_torch"] = True
+        ocr_params: dict[str, Any] = {}
+        if os.environ.get("CHAPTERWISE_RAPIDOCR_TORCH", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            ocr_params["Global.with_torch"] = True
 
-    init_started = time.perf_counter()
-    _RAPIDOCR_PDF = RapidOCRPDF(
-        dpi=rapidocr_dpi(),
-        ocr_params=ocr_params or None,
-    )
-    _add_debug_timing("rapidocr_init", time.perf_counter() - init_started)
-    return _RAPIDOCR_PDF
+        init_started = time.perf_counter()
+        _RAPIDOCR_PDF = RapidOCRPDF(
+            dpi=rapidocr_dpi(),
+            ocr_params=ocr_params or None,
+        )
+        _add_debug_timing("rapidocr_init", time.perf_counter() - init_started)
+        return _RAPIDOCR_PDF
 
 
 def _extract_texts_rapidocr_batch(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -25,6 +26,9 @@ try:
 except ImportError:
     pass
 
+# Match Kaggle: skip eager base64 during extract. Override with CHAPTERWISE_DEFER_IMAGE_B64=0.
+os.environ.setdefault("CHAPTERWISE_DEFER_IMAGE_B64", "1")
+
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
@@ -41,6 +45,7 @@ from pdf_extract import extract_document
 from security import MAX_PDF_BYTES, cors_origins, validate_pdf_bytes
 from topic_builder import DEFAULT_CHUNK_PAGES, build_topics_from_pages
 from topic_detail import build_topic_detail, clear_explanation_cache
+from qa import answer_question
 from tts import DEFAULT_VOICE, synthesize_speech
 
 ACTIVE_PDF_PATH = BASE_DIR / "active_doc.pdf"
@@ -69,6 +74,11 @@ class BuildTopicsRequest(BaseModel):
 class TtsRequest(BaseModel):
     text: str = Field(min_length=1)
     voice: str = Field(default=DEFAULT_VOICE, min_length=1, max_length=32)
+
+
+class AskRequest(BaseModel):
+    topic_id: str = Field(min_length=1)
+    question: str = Field(min_length=1)
 
 
 def _get_extraction() -> dict[str, Any]:
@@ -343,6 +353,18 @@ def get_topic(topic_id: str) -> dict[str, Any]:
         return build_topic_detail(topic_id, extraction, topics)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/ask")
+def ask_topic(body: AskRequest) -> dict[str, Any]:
+    extraction = _get_extraction()
+    topics = _get_topics()
+    try:
+        return answer_question(body.topic_id, body.question, extraction, topics)
+    except ValueError as exc:
+        detail = str(exc)
+        status = 404 if detail.startswith("Unknown topic") else 400
+        raise HTTPException(status_code=status, detail=detail) from exc
 
 
 @app.get("/debug/topics")
