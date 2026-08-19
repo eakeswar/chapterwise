@@ -252,8 +252,9 @@ export default function TopicView() {
   }
 
   return (
-    <main className="main-panel">
+    <main className="main-panel main-panel--topic">
       <article className="topic-view" aria-busy={loading}>
+        <div className="topic-view-scroll">
         <header className="topic-view-header">
           <div className="topic-view-kicker">{detail?.topic?.level || treeTopic?.level}</div>
           <h1>{detail?.topic?.title || treeTopic?.title}</h1>
@@ -306,8 +307,6 @@ export default function TopicView() {
                 <p className="topic-view-muted">No source text to explain for this page range.</p>
               ) : null}
             </section>
-
-            <AskPanel topicId={state.activeTopicId} />
 
             <section className="topic-section">
               <h2>Source text</h2>
@@ -384,6 +383,11 @@ export default function TopicView() {
               )}
             </section>
           </>
+        ) : null}
+        </div>
+
+        {!loading && !error && detail ? (
+          <AskPanel topicId={state.activeTopicId} />
         ) : null}
       </article>
     </main>
