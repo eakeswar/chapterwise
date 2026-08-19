@@ -44,7 +44,12 @@ from kaggle_client import (
 from pdf_extract import extract_document
 from security import MAX_PDF_BYTES, cors_origins, validate_pdf_bytes
 from topic_builder import DEFAULT_CHUNK_PAGES, build_topics_from_pages
-from topic_detail import build_topic_detail, clear_explanation_cache
+from topic_detail import (
+    InformationalImageError,
+    build_topic_detail,
+    clear_explanation_cache,
+    generate_topic_image,
+)
 from qa import answer_question
 from tts import DEFAULT_VOICE, synthesize_speech
 
@@ -314,8 +319,8 @@ def build_topics(body: BuildTopicsRequest | None = None) -> dict[str, Any]:
             build_started = time.perf_counter()
             result = build_topics_from_pages(
                 extraction["pages"],
-                page_start=request.page_start,
-                page_end=request.page_end,
+                page_start=request.page_start or extraction.get("page_start"),
+                page_end=request.page_end or extraction.get("page_end"),
                 chunk_pages=request.chunk_pages or DEFAULT_CHUNK_PAGES,
             )
             build_seconds = round(time.perf_counter() - build_started, 2)
@@ -351,6 +356,18 @@ def get_topic(topic_id: str) -> dict[str, Any]:
     topics = _get_topics()
     try:
         return build_topic_detail(topic_id, extraction, topics)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/topic/{topic_id}/images/{image_id}/generate")
+def generate_topic_decorative_image(topic_id: str, image_id: str) -> dict[str, Any]:
+    extraction = _get_extraction()
+    topics = _get_topics()
+    try:
+        return generate_topic_image(topic_id, image_id, extraction, topics)
+    except InformationalImageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

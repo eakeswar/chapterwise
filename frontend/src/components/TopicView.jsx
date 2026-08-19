@@ -1,11 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { findTopicById, useDoc } from '../context/DocContext'
-import { fetchTopic, synthesizeSpeech } from '../utils/apiClient'
+import { fetchTopic, generateTopicImage, synthesizeSpeech } from '../utils/apiClient'
 import TopicViewSkeleton from './TopicViewSkeleton'
 import Skeleton from './Skeleton'
 import AskPanel from './AskPanel'
+import MarkdownText from './MarkdownText'
 
 const TTS_CHAR_LIMIT = 3800
+const CLASSIFY_POLL_MS = 3000
+
+function imageNeedsClassifyPoll(image) {
+  return image?.classify_status === 'pending' || image?.enhance_kind === 'pending'
+}
+
+function canGenerateHd(image) {
+  return image?.classify_status === 'ready' && image?.enhance_role === 'decorative'
+}
 
 function pageRangeLabel(pageStart, pageEnd) {
   if (pageStart === pageEnd) return `Page ${pageStart}`
@@ -34,6 +44,15 @@ export default function TopicView() {
   const [ttsError, setTtsError] = useState(null)
   const audioRef = useRef(null)
   const audioUrlRef = useRef(null)
+  const [generatingIds, setGeneratingIds] = useState(() => new Set())
+  const [generateErrors, setGenerateErrors] = useState({})
+  const [showOriginalIds, setShowOriginalIds] = useState(() => new Set())
+
+  useEffect(() => {
+    setGeneratingIds(new Set())
+    setGenerateErrors({})
+    setShowOriginalIds(new Set())
+  }, [state.activeTopicId])
 
   useEffect(() => {
     if (!state.activeTopicId) {
@@ -77,6 +96,27 @@ export default function TopicView() {
   }, [state.activeTopicId, dispatch])
 
   useEffect(() => {
+    const topicId = state.activeTopicId
+    if (!topicId || !detail?.images?.some(imageNeedsClassifyPoll)) return undefined
+
+    let cancelled = false
+    const timer = setInterval(() => {
+      fetchTopic(topicId)
+        .then((payload) => {
+          if (cancelled) return
+          dispatch({ type: 'CACHE_TOPIC', payload })
+          setDetail(payload)
+        })
+        .catch(() => {})
+    }, CLASSIFY_POLL_MS)
+
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [state.activeTopicId, detail, dispatch])
+
+  useEffect(() => {
     return () => {
       if (audioUrlRef.current) {
         URL.revokeObjectURL(audioUrlRef.current)
@@ -110,6 +150,83 @@ export default function TopicView() {
     } finally {
       setTtsBusy(false)
     }
+  }
+
+  function patchTopicImage(imageId, patch) {
+    setDetail((current) => {
+      if (!current?.images) return current
+      const next = {
+        ...current,
+        images: current.images.map((image) =>
+          image.id === imageId ? { ...image, ...patch } : image,
+        ),
+      }
+      dispatch({ type: 'CACHE_TOPIC', payload: next })
+      return next
+    })
+  }
+
+  async function handleGenerateImage(image) {
+    const topicId = state.activeTopicId
+    if (!topicId || !image?.id || generatingIds.has(image.id)) return
+    if (!canGenerateHd(image)) return
+    setGeneratingIds((current) => new Set(current).add(image.id))
+    setGenerateErrors((current) => {
+      const next = { ...current }
+      delete next[image.id]
+      return next
+    })
+    try {
+      const payload = await generateTopicImage(topicId, image.id)
+      if (payload.status === 'ready' && payload.url) {
+        patchTopicImage(image.id, {
+          url: payload.url,
+          original_url: payload.original_url || image.original_url || image.url,
+          ext: payload.ext || image.ext,
+          enhance_kind: 'generated',
+          enhance_role: 'decorative',
+        })
+        setShowOriginalIds((current) => {
+          const next = new Set(current)
+          next.delete(image.id)
+          return next
+        })
+        return
+      }
+      patchTopicImage(image.id, {
+        url: payload.original_url || image.original_url || image.url,
+        original_url: payload.original_url || image.original_url || image.url,
+        enhance_kind: 'original',
+      })
+      setGenerateErrors((current) => ({
+        ...current,
+        [image.id]: payload.error || "Couldn't generate, try again",
+      }))
+    } catch (generateError) {
+      patchTopicImage(image.id, {
+        url: image.original_url || image.url,
+        enhance_kind: image.enhance_kind === 'generated' ? 'generated' : 'original',
+      })
+      setGenerateErrors((current) => ({
+        ...current,
+        [image.id]: generateError instanceof Error ? generateError.message : "Couldn't generate, try again",
+      }))
+    } finally {
+      setGeneratingIds((current) => {
+        const next = new Set(current)
+        next.delete(image.id)
+        return next
+      })
+    }
+  }
+
+  function toggleShowOriginal(imageId) {
+    setShowOriginalIds((current) => {
+      const next = new Set(current)
+      if (next.has(imageId)) next.delete(imageId)
+      else next.add(imageId)
+      return next
+    })
   }
 
   if (!state.activeTopicId) {
@@ -178,7 +295,7 @@ export default function TopicView() {
             <section className="topic-section">
               <h2>Explanation</h2>
               {detail.explanation ? (
-                <div className="topic-explanation">{detail.explanation}</div>
+                <MarkdownText className="topic-explanation">{detail.explanation}</MarkdownText>
               ) : detail.explanation_status === 'failed' ? (
                 <div className="topic-notice topic-notice-error">
                   Could not generate an explanation
@@ -201,18 +318,66 @@ export default function TopicView() {
               <h2>Images</h2>
               {detail.images?.length ? (
                 <div className="topic-gallery">
-                  {detail.images.map((image) => (
+                  {detail.images.map((image) => {
+                    const busy = generatingIds.has(image.id)
+                    const classifying = imageNeedsClassifyPoll(image)
+                    const showOriginal = showOriginalIds.has(image.id)
+                    const originalUrl = image.original_url || image.url
+                    const displayUrl =
+                      image.enhance_kind === 'generated' && !showOriginal
+                        ? image.url
+                        : image.enhance_kind === 'lanczos'
+                          ? image.url
+                          : originalUrl
+                    const generateError = generateErrors[image.id]
+                    return (
                     <figure key={image.id} className="topic-gallery-item">
-                      {image.url ? (
-                        <img src={image.url} alt={`Page ${image.page} figure`} loading="lazy" />
+                      {displayUrl ? (
+                        <img
+                          src={busy ? originalUrl : displayUrl}
+                          alt={`Page ${image.page} figure`}
+                          loading="lazy"
+                        />
                       ) : (
                         <div className="topic-gallery-placeholder">Image data unavailable</div>
                       )}
+                      {busy ? (
+                        <div className="topic-gallery-generating">Generating HD version…</div>
+                      ) : classifying ? (
+                        <div className="topic-gallery-generating">Checking image…</div>
+                      ) : null}
                       <figcaption>
                         Page {image.page} · {image.w}×{image.h}
+                        {image.enhance_kind ? ` · ${image.enhance_kind}` : ''}
+                        {canGenerateHd(image) ? (
+                          <div className="topic-gallery-actions">
+                            {image.enhance_kind === 'generated' ? (
+                              <button
+                                type="button"
+                                className="topic-gallery-button"
+                                onClick={() => toggleShowOriginal(image.id)}
+                              >
+                                {showOriginal ? 'Show HD version' : 'Show original'}
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                className="topic-gallery-button"
+                                disabled={busy || !originalUrl}
+                                onClick={() => handleGenerateImage(image)}
+                              >
+                                Generate HD version
+                              </button>
+                            )}
+                          </div>
+                        ) : null}
+                        {generateError ? (
+                          <div className="topic-gallery-error">Couldn&apos;t generate, try again</div>
+                        ) : null}
                       </figcaption>
                     </figure>
-                  ))}
+                    )
+                  })}
                 </div>
               ) : (
                 <p className="topic-view-muted">No images on these pages.</p>

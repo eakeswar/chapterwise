@@ -43,6 +43,17 @@ export async function buildTopics(options = {}) {
   return response.json()
 }
 
+export async function generateTopicImage(topicId, imageId) {
+  const response = await fetch(API.generateImage(topicId, imageId), {
+    method: 'POST',
+    headers: apiHeaders(),
+  })
+  if (!response.ok) {
+    throw new Error(await parseError(response))
+  }
+  return response.json()
+}
+
 export async function fetchTopic(topicId) {
   const response = await fetch(API.topic(topicId), {
     headers: apiHeaders(),

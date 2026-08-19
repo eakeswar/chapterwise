@@ -799,11 +799,15 @@ def build_topics_from_pages(
     if not pages:
         raise ValueError("No extracted pages available.")
 
-    total_pages = len(pages)
-    start_page = page_start or 1
-    end_page = page_end or total_pages
-    if start_page < 1 or end_page > total_pages or start_page > end_page:
-        raise ValueError(f"Invalid page range {start_page}-{end_page} for {total_pages}-page document.")
+    page_nums = [int(page["page"]) for page in pages]
+    min_page = min(page_nums)
+    max_page = max(page_nums)
+    start_page = page_start or min_page
+    end_page = page_end or max_page
+    if start_page < min_page or end_page > max_page or start_page > end_page:
+        raise ValueError(
+            f"Invalid page range {start_page}-{end_page} for extracted pages {min_page}-{max_page}."
+        )
 
     builder = TOPIC_BUILDER
     if builder not in ("regex", "llm"):

@@ -8,6 +8,7 @@ from typing import Any
 
 import fitz
 
+from image_enhance import clear_enhance_cache, enhance_topic_images, generate_decorative_on_demand
 from pdf_extract import encode_xref_data_url
 
 _EXPLANATION_CACHE: dict[str, str] = {}
@@ -22,6 +23,7 @@ _ACTIVE_PDF_FALLBACK = _BACKEND_DIR / "active_doc.pdf"
 
 def clear_explanation_cache() -> None:
     _EXPLANATION_CACHE.clear()
+    clear_enhance_cache()
     with _IMAGE_URL_CACHE_LOCK:
         _IMAGE_URL_CACHE.clear()
 
@@ -145,10 +147,15 @@ def _serialize_topic_images(
                     "isBackground": image.get("isBackground", False),
                     "overlapWordCount": image.get("overlapWordCount", 0),
                     "url": image.get("url"),
+                    "original_url": image.get("url"),
+                    "enhance_kind": "original",
+                    "enhance_role": "informational",
+                    "classify_status": "pending",
                 }
             )
     if pdf_path is not None:
         _hydrate_deferred_image_urls(pdf_path, images)
+    enhance_topic_images(images)
     return images
 
 
@@ -267,4 +274,69 @@ def build_topic_detail(
         "explanation_error": explanation_error,
         "images": images,
         "image_count": len(images),
+    }
+
+
+class InformationalImageError(ValueError):
+    """Raised when a generate request targets a formula/diagram image."""
+
+
+def generate_topic_image(
+    topic_id: str,
+    image_id: str,
+    extraction: dict[str, Any],
+    topics: dict[str, Any],
+) -> dict[str, Any]:
+    """On-demand decorative generation. status is ready | failed."""
+    topics_by_id = topics.get("topics_by_id") or {}
+    topic = topics_by_id.get(topic_id)
+    if not topic:
+        raise ValueError(f"Unknown topic id: {topic_id}")
+
+    page_start = int(topic["page_start"])
+    page_end = int(topic["page_end"])
+    pages = _pages_in_range(extraction["pages"], page_start, page_end)
+    images = _serialize_topic_images(pages, _resolve_pdf_path(extraction))
+    image = next((item for item in images if item.get("id") == image_id), None)
+    if not image:
+        raise ValueError(f"Unknown image id: {image_id}")
+
+    if (
+        image.get("classify_status") != "ready"
+        or image.get("enhance_role") != "decorative"
+    ):
+        raise InformationalImageError(
+            "Informational images cannot be regenerated with gpt-image-2."
+        )
+
+    original_url = image.get("original_url") or image.get("url")
+    if not original_url:
+        return {
+            "ok": True,
+            "status": "failed",
+            "error": "Image has no encoded source to generate from.",
+            "id": image_id,
+            "url": None,
+            "original_url": None,
+            "ext": image.get("ext"),
+            "enhance_kind": "original",
+            "enhance_role": "decorative",
+        }
+
+    result = generate_decorative_on_demand(
+        str(original_url),
+        topic_title=str(topic.get("title") or ""),
+        explanation=get_cached_explanation(topic_id),
+    )
+    display_url = result["url"] if result["status"] == "ready" else original_url
+    return {
+        "ok": True,
+        "status": result["status"],
+        "error": result.get("error"),
+        "id": image_id,
+        "url": display_url,
+        "original_url": original_url,
+        "ext": result.get("ext") or image.get("ext"),
+        "enhance_kind": result["kind"],
+        "enhance_role": "decorative",
     }

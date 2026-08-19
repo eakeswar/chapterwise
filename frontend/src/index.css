@@ -23,11 +23,12 @@ body,
 #root {
   margin: 0;
   width: 100%;
-  min-height: 100%;
+  height: 100%;
 }
 
 body {
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
 }
 
 button,
@@ -37,7 +38,8 @@ input {
 
 .app-shell {
   display: flex;
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .sidebar {
@@ -45,6 +47,8 @@ input {
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
   border-right: 1px solid var(--border);
   background: var(--surface);
 }
@@ -52,6 +56,7 @@ input {
 .upload-panel {
   padding: 16px;
   border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
 }
 
 .brand-row {
@@ -156,6 +161,7 @@ input {
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--muted);
+  flex-shrink: 0;
 }
 
 .topic-tree-empty {
@@ -166,6 +172,8 @@ input {
 }
 
 .topic-tree-list {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
   padding: 0 8px 16px;
 }
@@ -251,6 +259,8 @@ input {
 .main-panel {
   flex: 1;
   min-width: 0;
+  min-height: 0;
+  overflow: auto;
   padding: 32px;
 }
 
@@ -386,10 +396,31 @@ input {
   border: 1px solid var(--border);
   border-radius: 12px;
   background: #fff;
-  white-space: pre-wrap;
   word-break: break-word;
   font-size: 0.95rem;
   line-height: 1.65;
+}
+
+.topic-explanation p {
+  margin: 0 0 0.85em;
+}
+
+.topic-explanation p:last-child {
+  margin-bottom: 0;
+}
+
+.topic-explanation ul,
+.topic-explanation ol {
+  margin: 0 0 0.85em;
+  padding-left: 1.25em;
+}
+
+.topic-explanation li {
+  margin: 0.2em 0;
+}
+
+.topic-explanation strong {
+  font-weight: 650;
 }
 
 .ask-panel .ask-input {
@@ -441,13 +472,21 @@ input {
   border-radius: 12px;
   overflow: hidden;
   background: var(--surface);
+  position: relative;
 }
 
 .topic-gallery-item img {
   display: block;
   width: 100%;
   height: auto;
-  background: #f9fafb;
+  background-color: #f3f4f6;
+  background-image:
+    linear-gradient(45deg, #e5e7eb 25%, transparent 25%),
+    linear-gradient(-45deg, #e5e7eb 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #e5e7eb 75%),
+    linear-gradient(-45deg, transparent 75%, #e5e7eb 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
 }
 
 .topic-gallery-placeholder {
@@ -463,6 +502,42 @@ input {
   padding: 8px 10px;
   font-size: 0.75rem;
   color: var(--muted);
+}
+
+.topic-gallery-generating {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.86);
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.topic-gallery-actions {
+  margin-top: 8px;
+}
+
+.topic-gallery-button {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: #fff;
+  color: #1f2937;
+  border-radius: 8px;
+  padding: 4px 8px;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.topic-gallery-button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.topic-gallery-error {
+  margin-top: 6px;
+  color: var(--danger-text);
 }
 
 @keyframes skeleton-shimmer {

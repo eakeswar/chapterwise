@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { askQuestion } from '../utils/apiClient'
+import MarkdownText from './MarkdownText'
 
 export default function AskPanel({ topicId }) {
   const [question, setQuestion] = useState('')
@@ -52,7 +53,7 @@ export default function AskPanel({ topicId }) {
       </button>
       {busy ? <p className="topic-view-muted">Looking up an answer from this section…</p> : null}
       {!busy && result?.status === 'ready' && result.answer ? (
-        <div className="topic-explanation ask-answer">{result.answer}</div>
+        <MarkdownText className="topic-explanation ask-answer">{result.answer}</MarkdownText>
       ) : null}
       {!busy && result?.status === 'failed' ? (
         <div className="topic-notice topic-notice-error">

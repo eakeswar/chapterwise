@@ -25,35 +25,84 @@ except ImportError:
 MIN_IMAGE_DIM = 50
 # Browsers cannot paint JPEG2000/JBIG2 data URLs; convert those to PNG.
 _BROWSER_UNSAFE_IMAGE_EXTS = frozenset({"jpx", "jp2", "j2k", "jxr", "jb2"})
+_NON_RGB_COLORSPACE_TOKENS = ("cmyk", "separation", "devicen")
+_CMYK_CHANNEL_COUNT = 4
 
 
 def encode_xref_data_url(doc: fitz.Document, xref: int) -> tuple[str, str] | None:
     """Return (ext, data URL) for an image xref, or None if extract fails."""
+    img_dict: dict[str, Any] | None
     try:
         img_dict = doc.extract_image(xref)
     except Exception:
+        img_dict = None
+
+    if img_dict and img_dict.get("image") and not _needs_pixmap_decode(img_dict):
+        ext = str(img_dict.get("ext") or "png").lower()
+        image_bytes = img_dict["image"]
+        data_url = f"data:image/{ext};base64,{base64.b64encode(image_bytes).decode('utf-8')}"
+        return ext, data_url
+
+    converted = _xref_to_png_bytes(doc, xref)
+    if not converted:
         return None
-    image_bytes = img_dict.get("image")
-    if not image_bytes:
-        return None
+    data_url = f"data:image/png;base64,{base64.b64encode(converted).decode('utf-8')}"
+    return "png", data_url
+
+
+def _needs_pixmap_decode(img_dict: dict[str, Any]) -> bool:
+    """True when raw extract_image bytes are unsafe or incomplete for browsers."""
     ext = str(img_dict.get("ext") or "png").lower()
     if ext in _BROWSER_UNSAFE_IMAGE_EXTS:
-        converted = _xref_to_png_bytes(doc, xref)
-        if converted:
-            image_bytes = converted
-            ext = "png"
-    data_url = f"data:image/{ext};base64,{base64.b64encode(image_bytes).decode('utf-8')}"
-    return ext, data_url
+        return True
+    if int(img_dict.get("smask") or 0) > 0:
+        return True
+    if int(img_dict.get("bpc") or 8) < 8:
+        return True
+    if int(img_dict.get("colorspace") or 0) >= _CMYK_CHANNEL_COUNT:
+        return True
+    cs_name = str(img_dict.get("cs-name") or "").lower()
+    return any(token in cs_name for token in _NON_RGB_COLORSPACE_TOKENS)
+
+
+def _pixmap_to_browser_rgb(pix: fitz.Pixmap) -> fitz.Pixmap:
+    """Convert CMYK / Separation / Gray / DeviceN pixmaps to RGB; keep RGBA."""
+    if pix.colorspace is None:
+        return pix
+    if pix.alpha and pix.n == 4 and pix.colorspace.n == 3:
+        return pix
+    if not pix.alpha and pix.n == 3 and pix.colorspace.n == 3:
+        return pix
+    return fitz.Pixmap(fitz.csRGB, pix)
 
 
 def _xref_to_png_bytes(doc: fitz.Document, xref: int) -> bytes | None:
+    """Decode xref via Pixmap, convert to RGB, apply SMask as alpha, emit PNG."""
+    smask = 0
+    try:
+        info = doc.extract_image(xref)
+        smask = int((info or {}).get("smask") or 0)
+    except Exception:
+        smask = 0
+
     try:
         pix = fitz.Pixmap(doc, xref)
-        try:
-            return pix.tobytes("png")
-        except Exception:
-            pix = fitz.Pixmap(fitz.csRGB, pix)
-            return pix.tobytes("png")
+    except Exception:
+        return None
+
+    try:
+        pix = _pixmap_to_browser_rgb(pix)
+        if smask > 0:
+            try:
+                mask_pix = fitz.Pixmap(doc, smask)
+            except Exception:
+                mask_pix = None
+            if mask_pix is not None:
+                try:
+                    pix = fitz.Pixmap(pix, mask_pix)
+                finally:
+                    mask_pix = None
+        return pix.tobytes("png")
     except Exception:
         return None
 

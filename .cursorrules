@@ -25,11 +25,11 @@ Textbook PDF → ordered topics (chapters/sections/subsections) + per-topic expl
 |------|--------|--------|
 | **1** | Backend `/upload_pdf` + `pdf_extract.py` (per-page text + images) | ✅ Done |
 | **2** | Backend `/build_topics` + `topic_builder.py` (ordered tree; **regex default**, optional LLM) | 🟡 Partial — **regex TOC works** (full Class 9 Science 1299 pp → 223 topics / 214 headings in **0.16s**); title/order still OCR-noisy; **full-book false `Chapter N` hits** (duplicate/out-of-order chapter nodes); LLM path kept behind `CHAPTERWISE_TOPIC_BUILDER=llm` |
-| **3** | Frontend `UploadPanel` + `TopicTree` wired to upload + build_topics | 🟡 Partial — wired ✅; **sidebar does not inner-scroll** — expand-all ~223 nodes stretches the page (~13.7k px) because `.app-shell` is `min-height: 100vh` not a fixed viewport |
-| **4** | Backend `/topic/{id}` + Frontend `TopicView` (explanation + image gallery) | 🟡 Partial — LLM explanation + Listen ✅; **deferred image b64** + on-demand encode on `/topic`; gallery **drops `isBackground`**; image enhance pending |
+| **3** | Frontend `UploadPanel` + `TopicTree` wired to upload + build_topics | ✅ Done — wired; **sidebar inner-scrolls** (`.app-shell` `height: 100vh; overflow: hidden`; `.topic-tree-list` `flex:1; min-height:0; overflow: auto`) |
+| **4** | Backend `/topic/{id}` + Frontend `TopicView` (explanation + image gallery) | 🟡 Partial — LLM explanation + Listen ✅; **deferred image b64** + on-demand encode; gallery **drops `isBackground`**; markdown explanation/answers; enhance wired (step 7) |
 | **5** | Backend `/ask` + Frontend `AskPanel` (grounded Q&A) | ✅ Done — `qa.py` + `POST /ask` + `AskPanel` under explanation; refuse-to-guess prompt; no Q&A cache |
 | **6** | Backend `/tts` + Listen button in `TopicView` | ✅ Done — `/tts` + Listen; default voice **`shimmer`** (female); narrates explanation (falls back to source text) |
-| **7** | Backend `image_enhance.py` (informational → Lanczos, decorative → gpt-image-2) | 🟡 Partial — `gpt-image-2` helper works; Lanczos routing not wired |
+| **7** | Backend `image_enhance.py` (informational → Lanczos, decorative → gpt-image-2) | 🟡 Partial — **wired**: cheap classify + baked-text OCR; informational → Lanczos; decorative → **on-demand** `POST .../generate` (gpt-image-2). `overlapWordCount` still **0 on RapidOCR extract path** (ignored as a gate). |
 | **8** | End-to-end polish; revisit `# TODO v2` items | ⬜ Not started |
 
 **When continuing work:** follow this order. Do one step at a time unless the user explicitly asks for multiple steps. Get user test approval between major steps when they ask for that workflow.
@@ -48,10 +48,10 @@ chapterwise/
     text_provider.py           ← TEXT_PROVIDER routing (Azure chat / Kaggle Llama)
     pdf_extract.py             ← Per-page text + image extraction
     topic_builder.py           ← ordered topic tree (regex headings default; optional LLM)
-    topic_detail.py            ← Topic payload + LLM explanation + on-demand image b64
+    topic_detail.py            ← Topic payload + LLM explanation + on-demand image b64 + generate
     qa.py                      ← grounded /ask (step 5) ✅
     tts.py                     ← Azure TTS (step 6) ✅ default voice shimmer
-    image_enhance.py           ← gpt-image-2 helper (step 7 partial)
+    image_enhance.py           ← classify + Lanczos + on-demand gpt-image-2 (step 7)
     security.py                ← PDF validation, CORS, size limits
     requirements.txt
     .env                       ← secrets (gitignored; copy from .env.example)
@@ -77,11 +77,12 @@ chapterwise/
       components/
         UploadPanel.jsx        ← step 3 ✅
         TopicTree.jsx          ← step 3 ✅
-        TopicView.jsx          ← step 4 partial ✅ (AskPanel below explanation)
+        TopicView.jsx          ← step 4 (AskPanel + gallery Generate HD)
         UploadLoadingScreen.jsx ← animated upload/build loading
         TopicViewSkeleton.jsx  ← shimmer skeleton while topic loads
         Skeleton.jsx           ← reusable shimmer block
         AskPanel.jsx           ← step 5 ✅ grounded Q&A
+        MarkdownText.jsx       ← react-markdown for explanation + ask answers
       App.jsx
       main.jsx
       index.css
@@ -98,7 +99,8 @@ chapterwise/
 | GET | `/health` | Health check (+ Kaggle reachability, `text_provider`, LLM status) |
 | POST | `/upload_pdf` | Save PDF, extract pages; optional `?page_start=&page_end=`; returns `timing` (receive/extract/total seconds) |
 | POST | `/build_topics` | Build topic tree (default: heading regex; optional LLM). Returns `builder`, `timing.total_seconds` |
-| GET | `/topic/{topic_id}` | Topic metadata, source text, LLM explanation, images (encode deferred xrefs on demand; skip `isBackground`) |
+| GET | `/topic/{topic_id}` | Topic metadata, source text, LLM explanation, images (encode deferred xrefs on demand; skip `isBackground`; enhance classify) |
+| POST | `/topic/{topic_id}/images/{image_id}/generate` | On-demand gpt-image-2 for **decorative + classify_status=ready** only; 400 if informational/pending |
 | POST | `/ask` | `{ topic_id, question }` grounded answer (`status`: ready \| failed) |
 | POST | `/tts` | `{ text, voice? }` → MP3 audio (default voice `shimmer`) |
 | GET | `/debug/text` | Smoke-test text provider (Kaggle Llama or Azure chat) |
@@ -113,6 +115,7 @@ chapterwise/
 - `_active_topics` — topic tree + flat `topics_by_id`; cleared on new upload
 - `_explanation_cache` in `topic_detail.py` — per-topic LLM explanations; cleared on new upload
 - `_IMAGE_URL_CACHE` in `topic_detail.py` — on-demand image data URLs keyed by `{pdf fingerprint}:{xref}`; cleared on new upload
+- `_ENHANCE_CACHE` in `image_enhance.py` — SHA-256 of **source** bytes → Lanczos / generated / classify result (`classify_status` pending\|ready); cleared on new upload
 - Resets on server restart (`# TODO v2`: disk cache)
 
 ### PDF extraction (`pdf_extract.py`)
@@ -125,9 +128,11 @@ chapterwise/
 - **Header/footer detection:** samples **36 evenly spaced pages** (not full PDF) via `PDFMetadataAnalyzer`; result **cached** by path + size + SHA256(head 64KB + tail 64KB). Fixes ~90s header scan on partial extracts (e.g. pages 1–10).
 - **Debug timing:** `CHAPTERWISE_DEBUG_TIMING=1` logs per-phase seconds (pdf open, header/footer, rapidocr, images, worker pool).
 - **Deferred image b64:** `CHAPTERWISE_DEFER_IMAGE_B64` defaults **on** (`main.py` `setdefault` to `1`, same as Kaggle). Extract stores xref + bbox only; `/topic` encodes via `encode_xref_data_url()`. JPEG2000/`jpx` converted to PNG so browsers can paint. Override with `CHAPTERWISE_DEFER_IMAGE_B64=0`.
+- **Pixmap / SMask:** `encode_xref_data_url()` uses Pixmap (RGB + SMask as PNG alpha) when ext is unsafe, SMask present, bpc under 8, or CMYK/Separation/DeviceN. Raw `extract_image` PNG for 1-bit ICC Gray + SMask was **solid black** in browsers (artwork lived in the mask). Empty color+mask → fully transparent PNG.
+- **`overlapWordCount`:** only attached on the **pdfplumber** text path. **RapidOCR extract path never computes it** (all images store `0`). Do **not** treat overlap=0 as evidence of decorative. Cheap classify uses aspect + gray/line-art only; baked-in labels need the image-pixel OCR gate.
 - **RapidOCR init:** `_get_rapidocr_pdf()` double-checked under `_RAPIDOCR_LOCK` — one `RapidOCRPDF` per process, not one per first-wave thread.
 - **Kaggle defaults** (in `chapterwise_gpu_server.py`): deferred image base64, skip overlap counts, process pool.
-- `# TODO v2`: classify formula vs decorative images; skip re-upload if PDF hash unchanged on Kaggle
+- `# TODO v2`: skip re-upload if PDF hash unchanged on Kaggle; restore `overlapWordCount` on RapidOCR extract path
 
 ### Kaggle remote extraction (`kaggle_client.py`, `kaggle/chapterwise_gpu_server.py`)
 
@@ -163,7 +168,7 @@ chapterwise/
 - **`/build_topics` response** includes `builder` (`regex`|`llm`) and optional `heading_count`.
 - **Known regex limits (defer vs fix):** (1) `_SECTION_RE` title group can eat across column gaps (`Physical Nature of Matter of sa`); (2) headings glued mid-line truncate (`…glass1.2 Characteristics of Particles of`); (3) RapidOCR text is **not** column-aware reading order — e.g. page 6 emits `1.4.1 EFFECT` before `1.4 Can Matter…`, so tree order follows OCR stream.
 - **LLM path (legacy):** `CHAPTERWISE_TOPIC_BUILDER=llm` — chunk by `CHAPTERWISE_TOPIC_CHUNK_PAGES`, Kaggle/Azure chat, JSON repair + retry. Large topic prompts (~12k chars) hang on Kaggle Llama 1B; tiny/medium chats (~2s) are fine.
-- Optional body on `/build_topics`: `{ page_start, page_end, chunk_pages }` (`chunk_pages` only matters for `llm`)
+- Optional body on `/build_topics`: `{ page_start, page_end, chunk_pages }` (`chunk_pages` only matters for `llm`). Range uses **extracted PDF page numbers**, not a 1-based remapped slice.
 
 ### Kaggle chat reliability (2026-08-12)
 
@@ -179,8 +184,8 @@ chapterwise/
 ## 5. Implemented frontend
 
 - **UploadPanel:** PDF upload → `/upload_pdf` → `/build_topics`; optional “Test first pages only” passes `?page_start=1&page_end=N` to **upload** (partial extract) and build_topics; shows upload/extract + build timing after success
-- **TopicTree:** Collapsible chapter → section → subsection; **never re-sort** client-side. Not virtualized. Default opens first chapter only. Expand-all on a full-book tree (~223 nodes) currently **grows the page** instead of scrolling inside the sidebar (`.app-shell` `min-height: 100vh`, overflow visible).
-- **TopicView:** Fetches `GET /topic/{id}`; shows **LLM explanation** + `AskPanel` + source text + image gallery (no background images); **Listen** calls `POST /tts` with title + explanation (falls back to source text); shimmer skeleton while loading
+- **TopicTree:** Collapsible chapter → section → subsection; **never re-sort** client-side. Not virtualized. Default opens first chapter only. Sidebar list **inner-scrolls** (`.app-shell` `height: 100vh; overflow: hidden`; `.topic-tree-list` `overflow: auto`).
+- **TopicView:** Fetches `GET /topic/{id}`; **markdown** explanation (`MarkdownText` / `react-markdown`; TTS still raw text); `AskPanel`; source text; image gallery (no backgrounds). **Listen** → `POST /tts`. Gallery: informational/pending → no Generate HD; decorative + `classify_status=ready` → **Generate HD version**; generated → Show original. Polls `/topic` every 3s while any image is `classify_status=pending`. Shimmer skeleton while loading.
 - **AskPanel:** Textarea + Ask button (`onClick`, no `<form>`); `POST /ask` with `activeTopicId`; loading / answer / `topic-notice-error`; clears on topic switch
 - **UploadLoadingScreen:** Animated main-panel loading during upload/build (shimmer progress bar + step labels + **live elapsed timer** + layout preview)
 - **DocContext:** `topicTree`, `activeTopicId`, `topicCache`, `uploadTiming`, `buildTiming`, upload/build phases
@@ -248,6 +253,13 @@ cd frontend && npm install
 - **2026-08-14 — Step 5 Q&A:** `qa.py` `answer_question()` + `POST /ask` `{ topic_id, question }`. Context = cached explanation (if any) + page-range source. System prompt: answer only from context, else say this section does not have enough information. HTTP 200 + `status=failed` on provider error (same fail-fast as `/topic`). `AskPanel` in `TopicView`. Smoke: Activity 1.1 → “Panch Tatva”; boiling point of water refused.
 - **2026-08-14 — Full-book TOC + UI:** `/build_topics` on 1299 pp → **223 topics / 214 headings / 0.16s**. Regex false `Chapter N` matches → 37 chapter nodes, duplicate/out-of-order titles (e.g. several “Chapter 6”, last “Chapter 8” at pp.1290–1299 is likely answers/appendix). Start/mid/end `/topic` + `/ask` + Listen worked (Activity 1.1 p.1, Activity 8.4 p.650, ch37 pp.1290–1299). TTS default voice **`shimmer`**.
 - **2026-08-14 — TTS voice:** `tts.py` `DEFAULT_VOICE = "shimmer"` (female). Listen does not pass `voice`, so this default applies. Restart backend after the change (clears in-memory extract).
+- **2026-08-17 — Black gallery images (SMask):** Page-1-style 1-bit ICC Gray + **SMask** decoded as raw PNG looked solid black (artwork in the mask). `encode_xref_data_url()` now Pixmap-decodes unsafe/SMask/low-bpc/CMYK/Separation images to RGB PNG with mask as alpha.
+- **2026-08-17 — Step 7 on-demand generate:** `/topic` Lanczos for informational+low quality; decorative stays original unless cache already has `kind=generated`. **`POST /topic/{id}/images/{image_id}/generate`** — 400 if not decorative (`InformationalImageError`); Azure/timeout → HTTP 200 `{status: failed}`. Size `1024x1024`. Gallery: Generate HD / Show original. Do **not** auto-run gpt-image-2 on topic open (pages with many decorative images, e.g. p174).
+- **2026-08-17 — Generate prompt must follow the photo:** Vision caption describes **only** the attached pixels (no topic). gpt-image-2 prompt: redraw that caption; topic title is **style only**. Negatives: no people/vehicles/animals/tools not in the caption. Including chapter explanation as subject turned “wheat grains” (p684) into a farm scene when generated from **`ch20` (Chapter 12)** instead of `ch20_s1_ss1`.
+- **2026-08-17 — Baked-in diagram labels:** Color labeled figures (p68 `p68_i0` XYLEM / `p68_i1` PHLOEM) classified decorative because overlap=0, aspect below 2.2, chroma above 25. Labels are **raster pixels**, not PDF text. **RapidOCR on the cropped image** (lazy, background, max side 512): at least one string (score ≥ 0.5, length ≥ 2) → force informational + Lanczos; photos like p684 wheat stay decorative. Eager full-book OCR is hours — **do not** run OCR on every extract image.
+- **2026-08-17 — Classify must not block `/topic`:** Would-be-decorative tiles return `classify_status=pending`, `enhance_role=informational` (Generate HD **blocked** until OCR finishes — fail conservative). 2-worker pool; cache by source hash. `TopicView` polls `/topic` every 3s. Cheap informational (wide aspect / gray line-art) skips OCR.
+- **2026-08-17 — Frontend polish:** `react-markdown` via `MarkdownText.jsx` for explanation + Ask answers (TTS still plain text). Topic tree viewport scroll (see §5). `/build_topics` page range uses **extracted PDF page numbers** so a 172–176 slice is not remapped to “Pages 1–5”.
+- **2026-08-19 — Changelog/rules sync:** Audited staged (uncommitted) code vs `.cursorrules`. Feature work above landed **2026-08-14–17**; tonight’s diff is documentation alignment only — §2 build-order table, §4 endpoints/state, §5 frontend, §9 step-7 checklist, §11 known issues, §12 next steps. Staged files: `image_enhance.py`, `pdf_extract.py`, `topic_detail.py`, `main.py`, `topic_builder.py`, `TopicView.jsx`, `MarkdownText.jsx`, `AskPanel.jsx`, `index.css`, `api.js` / `apiClient.js`, `package.json`, `.gitignore` (test_output samples).
 
 ---
 
@@ -338,9 +350,10 @@ Frontend `.env` optional: `VITE_API_BASE_URL=http://127.0.0.1:8766`
 - ✅ LLM explanation via `text_provider.chat_completion` in `topic_detail.py` (`explanation_status`: ready | skipped | failed)
 - ✅ Listen button via `POST /tts` (narrates explanation, falls back to source text)
 - ✅ Deferred extract b64; `/topic` encodes on demand; gallery skips `isBackground`
-- ⬜ Run images through `image_enhance.py` before return (step 7 can be wired incrementally)
+- ✅ Images run through `image_enhance.py` on `/topic` (cheap classify + background baked-text OCR; Lanczos for informational+low quality)
+- ✅ On-demand decorative generate: `POST /topic/{id}/images/{image_id}/generate`
 - ⬜ Optional: assign non-bg images to same-page sibling topics via heading offset vs image `y` (deferred — rare on Class 9 pp.1–8)
-- `# TODO v2`: formula vs decorative classification in gallery
+- `# TODO v2`: richer formula vs decorative classification; compute `overlapWordCount` on RapidOCR extract path (PyMuPDF words) if we want overlap as an informational shortcut again
 
 ### `/ask` + `AskPanel`
 
@@ -356,11 +369,14 @@ Frontend `.env` optional: `VITE_API_BASE_URL=http://127.0.0.1:8766`
 
 ### `image_enhance.py` (§4a)
 
-- ✅ `generate_decorative_image()` via `gpt-image-2` (smoke-tested)
-- ⬜ Classify informational vs decorative (Veda-style heuristics: overlapWordCount, aspect/area)
-- ⬜ Quality: small (< 400px) or blurry (Laplacian variance < 100)
-- ⬜ Route: informational → **Lanczos only**; decorative + low quality → `gpt-image-2` (never regenerate formulas)
-- ⬜ In-memory cache keyed by image hash
+- ✅ `generate_decorative_image()` via `gpt-image-2` (size `1024x1024`)
+- ✅ Cheap classify: aspect ≥ 2.2 or gray/line-art (mean chroma under 25) → informational. **`overlapWordCount` is not a gate** (RapidOCR extract always stores 0).
+- ✅ Baked-text OCR (RapidOCR on image pixels, downscaled max 512): if would-be decorative, run **in background**; ≥1 decent string → informational. Until `classify_status=ready`, treat as informational (no Generate HD).
+- ✅ Quality: small (`SMALL_IMAGE_MIN_DIM=400`) or blurry (Laplacian under `BLUR_VARIANCE_THRESHOLD=100`)
+- ✅ Route: informational + low quality → **Lanczos**; decorative → original until user **Generate HD** (never gpt-image-2 formulas/diagrams)
+- ✅ Prompt: vision describes the photo only; generate prompt is caption-primary + style from topic **title** only (no explanation dump)
+- ✅ In-memory `_ENHANCE_CACHE` keyed by source SHA-256 (includes classify result; decorative originals are cached so OCR does not rerun)
+- Do **not** auto-generate decorative images on `/topic` (too many per page; Azure cost + latency)
 
 ---
 
@@ -387,7 +403,8 @@ Frontend `.env` optional: `VITE_API_BASE_URL=http://127.0.0.1:8766`
 - **Kaggle Llama runtime:** Use `CHAPTERWISE_LLM_PRELOAD=1`. CUDA OOM on T4 → `CHAPTERWISE_TOPIC_CHUNK_PAGES=4` or `8`, `CHAPTERWISE_LLM_MAX_INPUT_CHARS=12000`, `CHAPTERWISE_LLM_MAX_NEW_TOKENS=1024`, republish dataset after `llm_server.py` / `chapterwise_gpu_server.py` changes. Llama 1B may return malformed topic JSON → repair + retry in `topic_builder.py` (retry assistant capped at 2000 chars).
 - **Large PDFs (e.g. 300 MB):** Browser sends full file to laptop every upload. “Test first pages only” limits **extract** page range, not upload size. Kaggle path uploads all 76×4 MB chunks before extract. Local **full-book** extract of Class 9 Science (1299 pp / 301 MB) ≈ **3.5 min** with defer-b64 + RapidOCR (was ~4.8 min with eager b64). Partial 15–20 pages ≈ 3–5 min was the old pdfplumber-era figure — RapidOCR + header-sample cache is much faster for small ranges (~6–8s for pp.1–10).
 - **Full-book regex TOC:** 223 topics in 0.16s, but many false `Chapter N` headings (duplicate/out-of-order chapter nodes). Title spill / two-column OCR order still present on early pages.
-- **TopicTree viewport:** Expanding the full tree stretches `document` height instead of scrolling inside `.topic-tree-list`. Fix: give `.app-shell` / `.sidebar` a bounded height (`100vh` + `overflow: hidden` / inner `overflow: auto`).
+- **`overlapWordCount` is unused on laptop RapidOCR extracts** (2732/2732 were 0 on Class 9 Science). Color diagrams with labels painted into the JPEG (p68 xylem/phloem) need baked-text OCR, not PDF overlap.
+- **Generate HD from a chapter node** (`ch20` = whole Chapter 12) used to illustrate the **topic**, not the photo. Generate from the tight subsection when possible; prompt no longer injects explanation as subject.
 - Only one upload/build at a time (`_extraction_lock`); backend blocks `/health` during active job
 - **Port 8766 in use:** Stop prior `python backend/main.py` (Ctrl+C) before restarting
 - Restart backend after `.env` changes; restart clears in-memory extraction/topics/explanations
@@ -399,6 +416,6 @@ Frontend `.env` optional: `VITE_API_BASE_URL=http://127.0.0.1:8766`
 
 ## 12. Next step when user says “continue”
 
-**Next:** (1) Tighten regex TOC for full-book false `Chapter N` hits / title spill / two-column order. (2) Fix TopicTree inner scroll (sidebar viewport) so expand-all does not stretch the page. (3) Step 7 image routing (Lanczos vs gpt-image-2). (4) Optional later: same-page non-bg image split by heading offset vs `y`. (5) `# TODO v2`: skip Kaggle upload when page range set; background extract; disk cache; optional Kaggle CPU extract+regex without Llama.
+**Next:** (1) Tighten regex TOC for full-book false `Chapter N` hits / title spill / two-column order. (2) Optional: compute `overlapWordCount` on the RapidOCR extract path (PyMuPDF words vs image rects) as an extra informational shortcut. (3) Optional later: same-page non-bg image split by heading offset vs `y`. (4) `# TODO v2`: skip Kaggle upload when page range set; background extract; disk cache; optional Kaggle CPU extract+regex without Llama.
 
-**Dev defaults (2026-08-14):** `EXTRACT_PROVIDER=local`, `CHAPTERWISE_TOPIC_BUILDER=regex`, `TEXT_PROVIDER=azure` (`gpt-4.1-mini` via `AZURE_CHAT_*`), `CHAPTERWISE_TEXT_EXTRACTOR=rapidocr`, `CHAPTERWISE_DEFER_IMAGE_B64=1` (code default), TTS voice **`shimmer`**. Kaggle is optional. Notebook LLM defaults if used: `MAX_NEW_TOKENS=512`, `MAX_TIME_SECONDS=90`, `CHAT_JOB_MAX_SECONDS=120`.
+**Dev defaults (2026-08-17):** `EXTRACT_PROVIDER=local`, `CHAPTERWISE_TOPIC_BUILDER=regex`, `TEXT_PROVIDER=azure` (`gpt-4.1-mini` via `AZURE_CHAT_*`), `CHAPTERWISE_TEXT_EXTRACTOR=rapidocr`, `CHAPTERWISE_DEFER_IMAGE_B64=1` (code default), TTS voice **`shimmer`**, decorative gpt-image-2 **on-demand only**. Kaggle is optional. Notebook LLM defaults if used: `MAX_NEW_TOKENS=512`, `MAX_TIME_SECONDS=90`, `CHAT_JOB_MAX_SECONDS=120`.
