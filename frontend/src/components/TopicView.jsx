@@ -40,6 +40,7 @@ export default function TopicView() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [detail, setDetail] = useState(cached)
+  const [askOpen, setAskOpen] = useState(false)
   const [ttsBusy, setTtsBusy] = useState(false)
   const [ttsError, setTtsError] = useState(null)
   const audioRef = useRef(null)
@@ -49,9 +50,19 @@ export default function TopicView() {
   const [showOriginalIds, setShowOriginalIds] = useState(() => new Set())
 
   useEffect(() => {
+    setAskOpen(false)
     setGeneratingIds(new Set())
     setGenerateErrors({})
     setShowOriginalIds(new Set())
+    setTtsError(null)
+    if (audioRef.current) {
+      audioRef.current.pause()
+      audioRef.current.removeAttribute('src')
+    }
+    if (audioUrlRef.current) {
+      URL.revokeObjectURL(audioUrlRef.current)
+      audioUrlRef.current = null
+    }
   }, [state.activeTopicId])
 
   useEffect(() => {
@@ -229,6 +240,76 @@ export default function TopicView() {
     })
   }
 
+  function renderGallery() {
+    if (!detail?.images?.length) {
+      return <p className="topic-view-muted">No images on these pages.</p>
+    }
+    return (
+      <div className="topic-gallery">
+        {detail.images.map((image) => {
+          const busy = generatingIds.has(image.id)
+          const classifying = imageNeedsClassifyPoll(image)
+          const showOriginal = showOriginalIds.has(image.id)
+          const originalUrl = image.original_url || image.url
+          const displayUrl =
+            image.enhance_kind === 'generated' && !showOriginal
+              ? image.url
+              : image.enhance_kind === 'lanczos'
+                ? image.url
+                : originalUrl
+          const generateError = generateErrors[image.id]
+          return (
+            <figure key={image.id} className="topic-gallery-item">
+              {displayUrl ? (
+                <img
+                  src={busy ? originalUrl : displayUrl}
+                  alt={`Page ${image.page} figure`}
+                  loading="lazy"
+                />
+              ) : (
+                <div className="topic-gallery-placeholder">Image data unavailable</div>
+              )}
+              {busy ? (
+                <div className="topic-gallery-generating">Generating HD version…</div>
+              ) : classifying ? (
+                <div className="topic-gallery-generating">Checking image…</div>
+              ) : null}
+              <figcaption>
+                Page {image.page} · {image.w}×{image.h}
+                {image.enhance_kind ? ` · ${image.enhance_kind}` : ''}
+                {canGenerateHd(image) ? (
+                  <div className="topic-gallery-actions">
+                    {image.enhance_kind === 'generated' ? (
+                      <button
+                        type="button"
+                        className="topic-gallery-button"
+                        onClick={() => toggleShowOriginal(image.id)}
+                      >
+                        {showOriginal ? 'Show HD version' : 'Show original'}
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="topic-gallery-button"
+                        disabled={busy || !originalUrl}
+                        onClick={() => handleGenerateImage(image)}
+                      >
+                        Generate HD version
+                      </button>
+                    )}
+                  </div>
+                ) : null}
+                {generateError ? (
+                  <div className="topic-gallery-error">Couldn&apos;t generate, try again</div>
+                ) : null}
+              </figcaption>
+            </figure>
+          )
+        })}
+      </div>
+    )
+  }
+
   if (!state.activeTopicId) {
     return (
       <main className="main-panel">
@@ -255,141 +336,124 @@ export default function TopicView() {
     <main className="main-panel main-panel--topic">
       <article className="topic-view" aria-busy={loading}>
         <div className="topic-view-scroll">
-        <header className="topic-view-header">
-          <div className="topic-view-kicker">{detail?.topic?.level || treeTopic?.level}</div>
-          <h1>{detail?.topic?.title || treeTopic?.title}</h1>
-          {loading ? (
-            <div className="topic-view-meta-skeleton">
-              <Skeleton className="skeleton-meta" />
-            </div>
-          ) : (
-            <p className="topic-view-meta">
-              {pageRangeLabel(
-                detail?.topic?.page_start ?? treeTopic?.page_start,
-                detail?.topic?.page_end ?? treeTopic?.page_end,
-              )}
-              {detail?.source_char_count != null ? ` · ${detail.source_char_count.toLocaleString()} chars` : ''}
-              {detail?.image_count != null ? ` · ${detail.image_count} images` : ''}
-            </p>
-          )}
-          {parentLabel ? <p className="topic-view-parent">In section: {parentLabel}</p> : null}
-
-          <div className="topic-view-actions">
-            <button
-              type="button"
-              className="secondary-button"
-              disabled={!detail || loading || ttsBusy}
-              onClick={handleListen}
-            >
-              {ttsBusy ? 'Generating audio…' : 'Listen'}
-            </button>
-            <audio ref={audioRef} className="topic-audio" controls preload="none" />
-          </div>
-          {ttsError ? <div className="error-banner">{ttsError}</div> : null}
-        </header>
-
-        {loading ? <TopicViewSkeleton /> : null}
-        {error ? <div className="error-banner">{error}</div> : null}
-
-        {!loading && !error && detail ? (
-          <>
-            <section className="topic-section">
-              <h2>Explanation</h2>
-              {detail.explanation ? (
-                <MarkdownText className="topic-explanation">{detail.explanation}</MarkdownText>
-              ) : detail.explanation_status === 'failed' ? (
-                <div className="topic-notice topic-notice-error">
-                  Could not generate an explanation
-                  {detail.explanation_error ? `: ${detail.explanation_error}` : '.'}
-                  {' '}Source text is shown below.
-                </div>
-              ) : detail.explanation_status === 'skipped' ? (
-                <p className="topic-view-muted">No source text to explain for this page range.</p>
-              ) : null}
-            </section>
-
-            <section className="topic-section">
-              <h2>Source text</h2>
-              <pre className="topic-source">{detail.source_text || '[No text in this page range]'}</pre>
-            </section>
-
-            <section className="topic-section">
-              <h2>Images</h2>
-              {detail.images?.length ? (
-                <div className="topic-gallery">
-                  {detail.images.map((image) => {
-                    const busy = generatingIds.has(image.id)
-                    const classifying = imageNeedsClassifyPoll(image)
-                    const showOriginal = showOriginalIds.has(image.id)
-                    const originalUrl = image.original_url || image.url
-                    const displayUrl =
-                      image.enhance_kind === 'generated' && !showOriginal
-                        ? image.url
-                        : image.enhance_kind === 'lanczos'
-                          ? image.url
-                          : originalUrl
-                    const generateError = generateErrors[image.id]
-                    return (
-                    <figure key={image.id} className="topic-gallery-item">
-                      {displayUrl ? (
-                        <img
-                          src={busy ? originalUrl : displayUrl}
-                          alt={`Page ${image.page} figure`}
-                          loading="lazy"
-                        />
-                      ) : (
-                        <div className="topic-gallery-placeholder">Image data unavailable</div>
-                      )}
-                      {busy ? (
-                        <div className="topic-gallery-generating">Generating HD version…</div>
-                      ) : classifying ? (
-                        <div className="topic-gallery-generating">Checking image…</div>
-                      ) : null}
-                      <figcaption>
-                        Page {image.page} · {image.w}×{image.h}
-                        {image.enhance_kind ? ` · ${image.enhance_kind}` : ''}
-                        {canGenerateHd(image) ? (
-                          <div className="topic-gallery-actions">
-                            {image.enhance_kind === 'generated' ? (
-                              <button
-                                type="button"
-                                className="topic-gallery-button"
-                                onClick={() => toggleShowOriginal(image.id)}
-                              >
-                                {showOriginal ? 'Show HD version' : 'Show original'}
-                              </button>
-                            ) : (
-                              <button
-                                type="button"
-                                className="topic-gallery-button"
-                                disabled={busy || !originalUrl}
-                                onClick={() => handleGenerateImage(image)}
-                              >
-                                Generate HD version
-                              </button>
-                            )}
-                          </div>
-                        ) : null}
-                        {generateError ? (
-                          <div className="topic-gallery-error">Couldn&apos;t generate, try again</div>
-                        ) : null}
-                      </figcaption>
-                    </figure>
-                    )
-                  })}
+            <header className="topic-view-header">
+              <div className="topic-view-kicker">{detail?.topic?.level || treeTopic?.level}</div>
+              <h1>{detail?.topic?.title || treeTopic?.title}</h1>
+              {loading ? (
+                <div className="topic-view-meta-skeleton">
+                  <Skeleton className="skeleton-meta" />
                 </div>
               ) : (
-                <p className="topic-view-muted">No images on these pages.</p>
+                <p className="topic-view-meta">
+                  {pageRangeLabel(
+                    detail?.topic?.page_start ?? treeTopic?.page_start,
+                    detail?.topic?.page_end ?? treeTopic?.page_end,
+                  )}
+                  {detail?.source_char_count != null ? ` · ${detail.source_char_count.toLocaleString()} chars` : ''}
+                  {detail?.image_count != null ? ` · ${detail.image_count} images` : ''}
+                </p>
               )}
-            </section>
-          </>
-        ) : null}
-        </div>
+              {parentLabel ? <p className="topic-view-parent">In section: {parentLabel}</p> : null}
 
-        {!loading && !error && detail ? (
-          <AskPanel topicId={state.activeTopicId} />
-        ) : null}
+              <div className="topic-view-actions">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  disabled={!detail || loading || ttsBusy}
+                  onClick={handleListen}
+                >
+                  {ttsBusy ? 'Generating audio…' : 'Listen'}
+                </button>
+                <audio ref={audioRef} className="topic-audio" controls preload="none" />
+              </div>
+              {ttsError ? <div className="error-banner">{ttsError}</div> : null}
+            </header>
+
+            {loading ? <TopicViewSkeleton /> : null}
+            {error ? <div className="error-banner">{error}</div> : null}
+
+            {!loading && !error && detail ? (
+              <>
+                <section className="topic-section">
+                  <h2>Explanation</h2>
+                  {detail.explanation ? (
+                    <MarkdownText className="topic-explanation">{detail.explanation}</MarkdownText>
+                  ) : detail.explanation_status === 'failed' ? (
+                    <div className="topic-notice topic-notice-error">
+                      Could not generate an explanation
+                      {detail.explanation_error ? `: ${detail.explanation_error}` : '.'}
+                      {' '}Source text is shown below.
+                    </div>
+                  ) : detail.explanation_status === 'skipped' ? (
+                    <p className="topic-view-muted">No source text to explain for this page range.</p>
+                  ) : null}
+                </section>
+
+                <section className="topic-section">
+                  <h2>Source text</h2>
+                  <pre className="topic-source">{detail.source_text || '[No text in this page range]'}</pre>
+                </section>
+
+                <section className="topic-section">
+                  <h2>Images</h2>
+                  {renderGallery()}
+                </section>
+              </>
+            ) : null}
+        </div>
       </article>
+
+      {askOpen ? (
+        <button
+          type="button"
+          className="ask-drawer-backdrop"
+          aria-label="Close ask drawer"
+          onClick={() => setAskOpen(false)}
+        />
+      ) : null}
+
+      <aside
+        id="ask-drawer"
+        className={`ask-drawer${askOpen ? ' ask-drawer-open' : ''}`}
+        aria-label="Ask about this topic"
+        aria-hidden={!askOpen}
+      >
+        <div className="ask-drawer-header">
+          <h2>Ask about this topic</h2>
+          <button
+            type="button"
+            className="ask-drawer-close"
+            aria-label="Close ask drawer"
+            onClick={() => setAskOpen(false)}
+          >
+            ×
+          </button>
+        </div>
+        {!loading && !error && detail ? (
+          <AskPanel topicId={state.activeTopicId} layout="column" />
+        ) : (
+          <p className="topic-view-muted ask-drawer-empty">Load a topic to ask questions.</p>
+        )}
+      </aside>
+
+      <button
+        type="button"
+        className="ask-fab"
+        aria-expanded={askOpen}
+        aria-controls="ask-drawer"
+        onClick={() => setAskOpen((open) => !open)}
+      >
+        <svg className="ask-fab-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path
+            d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4v8z"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinejoin="round"
+          />
+        </svg>
+        <span>Ask about this topic</span>
+      </button>
     </main>
   )
 }
