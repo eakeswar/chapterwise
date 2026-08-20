@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { findTopicById, useDoc } from '../context/DocContext'
-import { fetchTopic, generateTopicImage, synthesizeSpeech } from '../utils/apiClient'
+import { fetchTopic, generateTopicImage, streamTopicExplanation, synthesizeSpeech } from '../utils/apiClient'
+import { mergeTopicPoll } from '../utils/mergeTopicPoll'
 import TopicViewSkeleton from './TopicViewSkeleton'
 import Skeleton from './Skeleton'
 import AskPanel from './AskPanel'
@@ -8,6 +9,19 @@ import MarkdownText from './MarkdownText'
 
 const TTS_CHAR_LIMIT = 3800
 const CLASSIFY_POLL_MS = 3000
+const DEFAULT_TTS_VOICE = 'shimmer'
+const TTS_VOICES = [
+  { id: 'shimmer', label: 'Shimmer (default)' },
+  { id: 'alloy', label: 'Alloy' },
+  { id: 'echo', label: 'Echo' },
+  { id: 'fable', label: 'Fable' },
+  { id: 'onyx', label: 'Onyx' },
+  { id: 'nova', label: 'Nova' },
+  { id: 'coral', label: 'Coral' },
+  { id: 'ash', label: 'Ash' },
+  { id: 'sage', label: 'Sage' },
+  { id: 'verse', label: 'Verse' },
+]
 
 function imageNeedsClassifyPoll(image) {
   return image?.classify_status === 'pending' || image?.enhance_kind === 'pending'
@@ -31,6 +45,25 @@ function buildNarrationText(detail) {
   return `${intro}${body}`.trim()
 }
 
+function explanationIsTerminal(detail) {
+  return detail?.explanation_status === 'ready' || detail?.explanation_status === 'skipped'
+}
+
+function recordPollMerge(current, incoming, merged) {
+  if (typeof window === 'undefined') return
+  const entry = {
+    at: Date.now(),
+    incomingStatus: incoming?.explanation_status ?? null,
+    incomingExplanationLen: incoming?.explanation ? incoming.explanation.length : 0,
+    currentStatus: current?.explanation_status ?? null,
+    currentExplanationLen: current?.explanation ? current.explanation.length : 0,
+    mergedStatus: merged?.explanation_status ?? null,
+    mergedExplanationLen: merged?.explanation ? merged.explanation.length : 0,
+  }
+  window.__chapterwisePollMerges = window.__chapterwisePollMerges || []
+  window.__chapterwisePollMerges.push(entry)
+}
+
 export default function TopicView() {
   const { state, dispatch } = useDoc()
   const chapters = state.topicTree?.chapters || []
@@ -43,11 +76,13 @@ export default function TopicView() {
   const [askOpen, setAskOpen] = useState(false)
   const [ttsBusy, setTtsBusy] = useState(false)
   const [ttsError, setTtsError] = useState(null)
+  const [ttsVoice, setTtsVoice] = useState(DEFAULT_TTS_VOICE)
   const audioRef = useRef(null)
   const audioUrlRef = useRef(null)
   const [generatingIds, setGeneratingIds] = useState(() => new Set())
   const [generateErrors, setGenerateErrors] = useState({})
   const [showOriginalIds, setShowOriginalIds] = useState(() => new Set())
+  const [sourceOpen, setSourceOpen] = useState(false)
 
   useEffect(() => {
     setAskOpen(false)
@@ -55,6 +90,7 @@ export default function TopicView() {
     setGenerateErrors({})
     setShowOriginalIds(new Set())
     setTtsError(null)
+    setSourceOpen(false)
     if (audioRef.current) {
       audioRef.current.pause()
       audioRef.current.removeAttribute('src')
@@ -74,7 +110,13 @@ export default function TopicView() {
     }
 
     const known = state.topicCache[state.activeTopicId]
-    if (known) {
+    if (known && explanationIsTerminal(known)) {
+      setDetail(known)
+      setError(null)
+      setLoading(false)
+      return
+    }
+    if (known?.explanation_status === 'pending') {
       setDetail(known)
       setError(null)
       setLoading(false)
@@ -106,17 +148,23 @@ export default function TopicView() {
     }
   }, [state.activeTopicId, dispatch])
 
+  const needsClassifyPoll = Boolean(detail?.images?.some(imageNeedsClassifyPoll))
+
   useEffect(() => {
     const topicId = state.activeTopicId
-    if (!topicId || !detail?.images?.some(imageNeedsClassifyPoll)) return undefined
+    if (!topicId || !needsClassifyPoll) return undefined
 
     let cancelled = false
     const timer = setInterval(() => {
       fetchTopic(topicId)
         .then((payload) => {
           if (cancelled) return
-          dispatch({ type: 'CACHE_TOPIC', payload })
-          setDetail(payload)
+          setDetail((current) => {
+            const merged = mergeTopicPoll(current, payload)
+            recordPollMerge(current, payload, merged)
+            dispatch({ type: 'CACHE_TOPIC', payload: merged })
+            return merged
+          })
         })
         .catch(() => {})
     }, CLASSIFY_POLL_MS)
@@ -125,7 +173,96 @@ export default function TopicView() {
       cancelled = true
       clearInterval(timer)
     }
-  }, [state.activeTopicId, detail, dispatch])
+  }, [state.activeTopicId, needsClassifyPoll, dispatch])
+
+  useEffect(() => {
+    const topicId = state.activeTopicId
+    if (!topicId || !detail || detail.topic?.id !== topicId) return undefined
+    if (detail.explanation_status !== 'pending') return undefined
+
+    const abort = new AbortController()
+    let assembled = ''
+
+    streamTopicExplanation(topicId, {
+      signal: abort.signal,
+      onDelta(text) {
+        assembled += text
+        setDetail((current) => {
+          if (!current || current.topic?.id !== topicId) return current
+          const next = {
+            ...current,
+            explanation: assembled,
+            explanation_status: 'pending',
+            explanation_error: null,
+          }
+          dispatch({ type: 'CACHE_TOPIC', payload: next })
+          return next
+        })
+      },
+      onDone() {
+        setDetail((current) => {
+          if (!current || current.topic?.id !== topicId) return current
+          const next = {
+            ...current,
+            explanation: assembled,
+            explanation_status: 'ready',
+            explanation_error: null,
+          }
+          dispatch({ type: 'CACHE_TOPIC', payload: next })
+          return next
+        })
+      },
+      onError(payload) {
+        const status = payload?.status === 'incomplete' || assembled ? 'incomplete' : 'failed'
+        setDetail((current) => {
+          if (!current || current.topic?.id !== topicId) return current
+          const next = {
+            ...current,
+            explanation: assembled || null,
+            explanation_status: status,
+            explanation_error: payload?.error || 'Explanation stream failed',
+          }
+          dispatch({ type: 'CACHE_TOPIC', payload: next })
+          return next
+        })
+      },
+    })
+      .then(() => {
+        if (abort.signal.aborted) return
+        setDetail((current) => {
+          if (!current || current.topic?.id !== topicId) return current
+          if (current.explanation_status !== 'pending') return current
+          const next = {
+            ...current,
+            explanation: assembled || null,
+            explanation_status: assembled ? 'incomplete' : 'failed',
+            explanation_error: current.explanation_error || 'Stream ended unexpectedly',
+          }
+          dispatch({ type: 'CACHE_TOPIC', payload: next })
+          return next
+        })
+      })
+      .catch((streamError) => {
+      if (abort.signal.aborted) return
+      if (streamError?.name === 'AbortError') return
+      setDetail((current) => {
+        if (!current || current.topic?.id !== topicId) return current
+        const status = assembled ? 'incomplete' : 'failed'
+        const next = {
+          ...current,
+          explanation: assembled || null,
+          explanation_status: status,
+          explanation_error: streamError instanceof Error ? streamError.message : 'Explanation stream failed',
+        }
+        dispatch({ type: 'CACHE_TOPIC', payload: next })
+        return next
+      })
+    })
+
+    return () => {
+      abort.abort()
+    }
+  }, [state.activeTopicId, detail?.topic?.id, detail?.explanation_status, dispatch])
 
   useEffect(() => {
     return () => {
@@ -146,7 +283,7 @@ export default function TopicView() {
     setTtsBusy(true)
     setTtsError(null)
     try {
-      const blob = await synthesizeSpeech(buildNarrationText(detail))
+      const blob = await synthesizeSpeech(buildNarrationText(detail), ttsVoice)
       if (audioUrlRef.current) {
         URL.revokeObjectURL(audioUrlRef.current)
       }
@@ -356,10 +493,25 @@ export default function TopicView() {
               {parentLabel ? <p className="topic-view-parent">In section: {parentLabel}</p> : null}
 
               <div className="topic-view-actions">
+                <label className="topic-voice-picker">
+                  <span className="topic-voice-label">Voice</span>
+                  <select
+                    className="topic-voice-select"
+                    value={ttsVoice}
+                    disabled={ttsBusy}
+                    onChange={(event) => setTtsVoice(event.target.value)}
+                  >
+                    {TTS_VOICES.map((voice) => (
+                      <option key={voice.id} value={voice.id}>
+                        {voice.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
                 <button
                   type="button"
                   className="secondary-button"
-                  disabled={!detail || loading || ttsBusy}
+                  disabled={!detail || loading || ttsBusy || detail.explanation_status !== 'ready'}
                   onClick={handleListen}
                 >
                   {ttsBusy ? 'Generating audio…' : 'Listen'}
@@ -376,7 +528,24 @@ export default function TopicView() {
               <>
                 <section className="topic-section">
                   <h2>Explanation</h2>
-                  {detail.explanation ? (
+                  {detail.explanation_status === 'pending' ? (
+                    <div className="topic-explanation topic-explanation-streaming">
+                      {detail.explanation || 'Writing explanation…'}
+                      <span className="stream-cursor" aria-hidden="true" />
+                    </div>
+                  ) : detail.explanation_status === 'incomplete' ? (
+                    <>
+                      {detail.explanation ? (
+                        <div className="topic-explanation topic-explanation-streaming">
+                          {detail.explanation}
+                        </div>
+                      ) : null}
+                      <div className="topic-notice topic-notice-error">
+                        This explanation may be incomplete
+                        {detail.explanation_error ? `: ${detail.explanation_error}` : '.'}
+                      </div>
+                    </>
+                  ) : detail.explanation_status === 'ready' && detail.explanation ? (
                     <MarkdownText className="topic-explanation">{detail.explanation}</MarkdownText>
                   ) : detail.explanation_status === 'failed' ? (
                     <div className="topic-notice topic-notice-error">
@@ -389,9 +558,26 @@ export default function TopicView() {
                   ) : null}
                 </section>
 
-                <section className="topic-section">
-                  <h2>Source text</h2>
-                  <pre className="topic-source">{detail.source_text || '[No text in this page range]'}</pre>
+                <section className={`topic-section${sourceOpen ? '' : ' topic-section-collapsed'}`}>
+                  <button
+                    type="button"
+                    className="topic-section-toggle"
+                    aria-expanded={sourceOpen}
+                    onClick={() => setSourceOpen((open) => !open)}
+                  >
+                    <span className="topic-section-toggle-title">
+                      Source text
+                      {detail.source_char_count != null
+                        ? ` (${detail.source_char_count.toLocaleString()} chars)`
+                        : ''}
+                    </span>
+                    <span className="topic-section-chevron" aria-hidden="true">
+                      {sourceOpen ? '▾' : '▸'}
+                    </span>
+                  </button>
+                  {sourceOpen ? (
+                    <pre className="topic-source">{detail.source_text || '[No text in this page range]'}</pre>
+                  ) : null}
                 </section>
 
                 <section className="topic-section">

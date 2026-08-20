@@ -31,7 +31,7 @@ os.environ.setdefault("CHAPTERWISE_DEFER_IMAGE_B64", "1")
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 
 from pydantic import BaseModel, Field
 
@@ -49,8 +49,9 @@ from topic_detail import (
     build_topic_detail,
     clear_explanation_cache,
     generate_topic_image,
+    iter_explanation_sse,
 )
-from qa import answer_question
+from qa import iter_ask_sse
 from tts import DEFAULT_VOICE, synthesize_speech
 
 ACTIVE_PDF_PATH = BASE_DIR / "active_doc.pdf"
@@ -84,6 +85,21 @@ class TtsRequest(BaseModel):
 class AskRequest(BaseModel):
     topic_id: str = Field(min_length=1)
     question: str = Field(min_length=1)
+
+
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+
+def _sse_response(chunks: Any) -> StreamingResponse:
+    return StreamingResponse(
+        chunks,
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )
 
 
 def _get_extraction() -> dict[str, Any]:
@@ -360,6 +376,16 @@ def get_topic(topic_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@app.get("/topic/{topic_id}/explanation/stream")
+def stream_topic_explanation(topic_id: str) -> StreamingResponse:
+    extraction = _get_extraction()
+    topics = _get_topics()
+    topics_by_id = topics.get("topics_by_id") or {}
+    if topic_id not in topics_by_id:
+        raise HTTPException(status_code=404, detail=f"Unknown topic id: {topic_id}")
+    return _sse_response(iter_explanation_sse(topic_id, extraction, topics))
+
+
 @app.post("/topic/{topic_id}/images/{image_id}/generate")
 def generate_topic_decorative_image(topic_id: str, image_id: str) -> dict[str, Any]:
     extraction = _get_extraction()
@@ -373,11 +399,14 @@ def generate_topic_decorative_image(topic_id: str, image_id: str) -> dict[str, A
 
 
 @app.post("/ask")
-def ask_topic(body: AskRequest) -> dict[str, Any]:
+def ask_topic(body: AskRequest) -> StreamingResponse:
     extraction = _get_extraction()
     topics = _get_topics()
+    topics_by_id = topics.get("topics_by_id") or {}
+    if body.topic_id not in topics_by_id:
+        raise HTTPException(status_code=404, detail=f"Unknown topic id: {body.topic_id}")
     try:
-        return answer_question(body.topic_id, body.question, extraction, topics)
+        return _sse_response(iter_ask_sse(body.topic_id, body.question, extraction, topics))
     except ValueError as exc:
         detail = str(exc)
         status = 404 if detail.startswith("Unknown topic") else 400

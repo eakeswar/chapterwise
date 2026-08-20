@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Any
 
 from topic_detail import (
     _compose_source_text,
     _pages_in_range,
     _trim_source_for_explanation,
+    format_sse_event,
     get_cached_explanation,
 )
 
@@ -35,13 +37,13 @@ def _build_ask_messages(
     ]
 
 
-def answer_question(
+def iter_ask_sse(
     topic_id: str,
     question: str,
     extraction: dict[str, Any],
     topics: dict[str, Any],
-) -> dict[str, Any]:
-    """Return { answer, status, error }. status is ready | failed."""
+) -> Iterator[str]:
+    """Yield SSE events for a grounded answer. Does not cache Q&A."""
     topics_by_id = topics.get("topics_by_id") or {}
     topic = topics_by_id.get(topic_id)
     if not topic:
@@ -58,24 +60,29 @@ def answer_question(
     explanation = get_cached_explanation(topic_id)
 
     if not source_text.strip() and not explanation:
-        return {
-            "answer": None,
-            "status": "failed",
-            "error": "No source text for this topic.",
-        }
+        yield format_sse_event(
+            "error",
+            {"status": "failed", "error": "No source text for this topic."},
+        )
+        return
 
     messages = _build_ask_messages(str(topic["title"]), cleaned, source_text, explanation)
+    assembled: list[str] = []
     try:
-        from text_provider import chat_completion
+        from text_provider import chat_completion_stream
 
-        answer = chat_completion(messages, temperature=0.2).strip()
+        for piece in chat_completion_stream(messages, temperature=0.2):
+            assembled.append(piece)
+            yield format_sse_event("delta", {"text": piece})
+        answer = "".join(assembled).strip()
         if not answer:
-            return {
-                "answer": None,
-                "status": "failed",
-                "error": "Empty response from text model.",
-            }
-        return {"answer": answer, "status": "ready", "error": None}
+            yield format_sse_event(
+                "error",
+                {"status": "failed", "error": "Empty response from text model."},
+            )
+            return
+        yield format_sse_event("done", {"status": "ready"})
     except Exception as exc:
-        print(f"Ask failed for {topic_id}: {exc}")
-        return {"answer": None, "status": "failed", "error": str(exc)}
+        print(f"Ask stream failed for {topic_id}: {exc}")
+        status = "incomplete" if "".join(assembled).strip() else "failed"
+        yield format_sse_event("error", {"status": status, "error": str(exc)})

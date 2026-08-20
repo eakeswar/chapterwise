@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import threading
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +32,10 @@ def clear_explanation_cache() -> None:
 
 def get_cached_explanation(topic_id: str) -> str | None:
     return _EXPLANATION_CACHE.get(topic_id)
+
+
+def format_sse_event(event: str, data: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def _pages_in_range(
@@ -201,36 +207,67 @@ def _has_explainable_text(source_text: str) -> bool:
     return False
 
 
-def _generate_explanation(
-    topic_id: str,
-    title: str,
-    source_text: str,
-    page_start: int,
-    page_end: int,
-) -> tuple[str | None, str, str | None]:
-    """Return (explanation, status, error). status is ready | skipped | failed."""
+def _explanation_snapshot(topic_id: str, source_text: str) -> tuple[str | None, str, str | None]:
+    """Cached or pending/skipped — never calls the LLM."""
     cached = _EXPLANATION_CACHE.get(topic_id)
     if cached is not None:
         return cached, "ready", None
-
-    trimmed = source_text.strip()
-    if not _has_explainable_text(trimmed):
+    if not _has_explainable_text(source_text.strip()):
         return None, "skipped", None
+    return None, "pending", None
 
-    trimmed = _trim_source_for_explanation(trimmed)
-    messages = _build_explanation_messages(title, trimmed, page_start, page_end)
 
+def iter_explanation_sse(
+    topic_id: str,
+    extraction: dict[str, Any],
+    topics: dict[str, Any],
+) -> Iterator[str]:
+    """Yield SSE events for a topic explanation. Caches only a complete successful text."""
+    topics_by_id = topics.get("topics_by_id") or {}
+    topic = topics_by_id.get(topic_id)
+    if not topic:
+        raise ValueError(f"Unknown topic id: {topic_id}")
+
+    cached = _EXPLANATION_CACHE.get(topic_id)
+    if cached is not None:
+        yield format_sse_event("delta", {"text": cached})
+        yield format_sse_event("done", {"status": "ready"})
+        return
+
+    page_start = int(topic["page_start"])
+    page_end = int(topic["page_end"])
+    pages = _pages_in_range(extraction["pages"], page_start, page_end)
+    source_text = _compose_source_text(pages)
+    if not _has_explainable_text(source_text.strip()):
+        yield format_sse_event("error", {"status": "failed", "error": "No source text to explain."})
+        return
+
+    messages = _build_explanation_messages(
+        str(topic["title"]),
+        _trim_source_for_explanation(source_text),
+        page_start,
+        page_end,
+    )
+    assembled: list[str] = []
     try:
-        from text_provider import chat_completion
+        from text_provider import chat_completion_stream
 
-        explanation = chat_completion(messages, temperature=0.3).strip()
+        for piece in chat_completion_stream(messages, temperature=0.3):
+            assembled.append(piece)
+            yield format_sse_event("delta", {"text": piece})
+        explanation = "".join(assembled).strip()
         if not explanation:
-            return None, "failed", "Empty response from text model."
+            yield format_sse_event(
+                "error",
+                {"status": "failed", "error": "Empty response from text model."},
+            )
+            return
         _EXPLANATION_CACHE[topic_id] = explanation
-        return explanation, "ready", None
+        yield format_sse_event("done", {"status": "ready"})
     except Exception as exc:
-        print(f"Topic explanation failed for {topic_id}: {exc}")
-        return None, "failed", str(exc)
+        print(f"Topic explanation stream failed for {topic_id}: {exc}")
+        status = "incomplete" if "".join(assembled).strip() else "failed"
+        yield format_sse_event("error", {"status": status, "error": str(exc)})
 
 
 def build_topic_detail(
@@ -249,12 +286,9 @@ def build_topic_detail(
     source_text = _compose_source_text(pages)
     images = _serialize_topic_images(pages, _resolve_pdf_path(extraction))
 
-    explanation, explanation_status, explanation_error = _generate_explanation(
+    explanation, explanation_status, explanation_error = _explanation_snapshot(
         topic_id,
-        str(topic["title"]),
         source_text,
-        page_start,
-        page_end,
     )
 
     return {

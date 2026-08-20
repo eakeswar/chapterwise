@@ -11,6 +11,8 @@ export const API = {
   upload: `${API_BASE}/upload_pdf`,
   buildTopics: `${API_BASE}/build_topics`,
   topic: (topicId) => `${API_BASE}/topic/${encodeURIComponent(topicId)}`,
+  topicExplanationStream: (topicId) =>
+    `${API_BASE}/topic/${encodeURIComponent(topicId)}/explanation/stream`,
   generateImage: (topicId, imageId) =>
     `${API_BASE}/topic/${encodeURIComponent(topicId)}/images/${encodeURIComponent(imageId)}/generate`,
   ask: `${API_BASE}/ask`,

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import time
+from collections.abc import Iterator
 from typing import Any
 
 from kaggle_client import (
@@ -40,6 +42,89 @@ def _azure_chat_completion(messages: list[dict[str, str]], *, temperature: float
     if not output:
         raise ValueError("Empty response from Azure chat model.")
     return output
+
+
+def _debug_fail_after_chars() -> int:
+    raw = (os.environ.get("CHAPTERWISE_STREAM_FAIL_AFTER_CHARS") or "0").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _debug_chunk_delay_seconds() -> float:
+    raw = (os.environ.get("CHAPTERWISE_STREAM_CHUNK_DELAY_MS") or "0").strip()
+    try:
+        return max(0, int(raw)) / 1000.0
+    except ValueError:
+        return 0.0
+
+
+def _apply_stream_debug(chunks: Iterator[str]) -> Iterator[str]:
+    """Optional test hooks: slow chunks and/or fail after N characters."""
+    fail_after = _debug_fail_after_chars()
+    delay_s = _debug_chunk_delay_seconds()
+    emitted = 0
+    for piece in chunks:
+        if not piece:
+            continue
+        if delay_s:
+            time.sleep(delay_s)
+        if fail_after and emitted + len(piece) >= fail_after:
+            keep = fail_after - emitted
+            if keep > 0:
+                yield piece[:keep]
+            raise RuntimeError(
+                "Simulated stream failure (CHAPTERWISE_STREAM_FAIL_AFTER_CHARS)"
+            )
+        emitted += len(piece)
+        yield piece
+
+
+def _azure_chat_completion_stream(
+    messages: list[dict[str, str]], *, temperature: float
+) -> Iterator[str]:
+    from azure_clients import get_text_client, get_text_deployment
+
+    client = get_text_client()
+    stream = client.chat.completions.create(
+        model=get_text_deployment(),
+        messages=messages,
+        temperature=temperature,
+        stream=True,
+    )
+    had_text = False
+    for chunk in stream:
+        choices = chunk.choices or []
+        if not choices:
+            continue
+        delta = getattr(choices[0], "delta", None)
+        text = (getattr(delta, "content", None) or "") if delta is not None else ""
+        if text:
+            had_text = True
+            yield text
+    if not had_text:
+        raise ValueError("Empty response from Azure chat model.")
+
+
+def chat_completion_stream(
+    messages: list[dict[str, str]], *, temperature: float = 0.2
+) -> Iterator[str]:
+    """Yield assistant text deltas from the configured text provider."""
+    provider = text_provider_name()
+
+    def _raw() -> Iterator[str]:
+        if should_use_kaggle_text(provider):
+            try:
+                yield kaggle_chat_completions(messages, temperature=temperature)
+                return
+            except Exception as exc:
+                if provider == "kaggle":
+                    raise
+                print(f"Kaggle text failed ({exc}); falling back to Azure.")
+        yield from _azure_chat_completion_stream(messages, temperature=temperature)
+
+    yield from _apply_stream_debug(_raw())
 
 
 def chat_completion(messages: list[dict[str, str]], *, temperature: float = 0.2) -> str:

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { askQuestion } from '../utils/apiClient'
+import { streamAskQuestion } from '../utils/apiClient'
 import MarkdownText from './MarkdownText'
 
 function AskComposer({ inputRef, question, busy, topicId, onQuestionChange, onAsk }) {
@@ -42,6 +42,45 @@ function AskComposer({ inputRef, question, busy, topicId, onQuestionChange, onAs
   )
 }
 
+function renderTurnAnswer(turn) {
+  if (turn.status === 'pending' && !turn.answer) {
+    return <p className="topic-view-muted">Thinking…</p>
+  }
+  if (turn.status === 'pending' || turn.status === 'streaming') {
+    return (
+      <div className="topic-explanation ask-answer topic-explanation-streaming">
+        {turn.answer || 'Writing answer…'}
+        <span className="stream-cursor" aria-hidden="true" />
+      </div>
+    )
+  }
+  if (turn.status === 'incomplete') {
+    return (
+      <>
+        {turn.answer ? (
+          <div className="topic-explanation ask-answer topic-explanation-streaming">{turn.answer}</div>
+        ) : null}
+        <div className="topic-notice topic-notice-error">
+          This answer may be incomplete
+          {turn.error ? `: ${turn.error}` : '.'}
+        </div>
+      </>
+    )
+  }
+  if (turn.status === 'ready' && turn.answer) {
+    return <MarkdownText className="topic-explanation ask-answer">{turn.answer}</MarkdownText>
+  }
+  if (turn.status === 'failed') {
+    return (
+      <div className="topic-notice topic-notice-error">
+        Couldn&apos;t answer
+        {turn.error ? `: ${turn.error}` : '.'}
+      </div>
+    )
+  }
+  return null
+}
+
 export default function AskPanel({ topicId, layout = 'column' }) {
   const inputRef = useRef(null)
   const [question, setQuestion] = useState('')
@@ -71,24 +110,53 @@ export default function AskPanel({ topicId, layout = 'column' }) {
     resizeInput()
     const turnIndex = turns.length
     setTurns((current) => [...current, { question: trimmed, status: 'pending' }])
+    let assembled = ''
     try {
-      const payload = await askQuestion(topicId, trimmed)
-      setTurns((current) => {
-        const next = [...current]
-        next[turnIndex] = {
-          question: trimmed,
-          answer: payload.answer,
-          status: payload.status,
-          error: payload.error,
-        }
-        return next
+      await streamAskQuestion(topicId, trimmed, {
+        onDelta(text) {
+          assembled += text
+          setTurns((current) => {
+            const next = [...current]
+            next[turnIndex] = {
+              question: trimmed,
+              answer: assembled,
+              status: 'streaming',
+            }
+            return next
+          })
+        },
+        onDone() {
+          setTurns((current) => {
+            const next = [...current]
+            next[turnIndex] = {
+              question: trimmed,
+              answer: assembled,
+              status: 'ready',
+            }
+            return next
+          })
+        },
+        onError(payload) {
+          const status = payload?.status === 'incomplete' || assembled ? 'incomplete' : 'failed'
+          setTurns((current) => {
+            const next = [...current]
+            next[turnIndex] = {
+              question: trimmed,
+              answer: assembled || null,
+              status,
+              error: payload?.error || 'Ask failed',
+            }
+            return next
+          })
+        },
       })
     } catch (askError) {
       setTurns((current) => {
         const next = [...current]
         next[turnIndex] = {
           question: trimmed,
-          status: 'failed',
+          answer: assembled || null,
+          status: assembled ? 'incomplete' : 'failed',
           error: askError instanceof Error ? askError.message : 'Ask failed',
         }
         return next
@@ -113,18 +181,7 @@ export default function AskPanel({ topicId, layout = 'column' }) {
           {turns.map((turn, index) => (
             <div key={`${turn.question}-${index}`} className="ask-turn">
               <div className="ask-turn-question">{turn.question}</div>
-              {turn.status === 'pending' ? (
-                <p className="topic-view-muted">Thinking…</p>
-              ) : null}
-              {turn.status === 'ready' && turn.answer ? (
-                <MarkdownText className="topic-explanation ask-answer">{turn.answer}</MarkdownText>
-              ) : null}
-              {turn.status === 'failed' ? (
-                <div className="topic-notice topic-notice-error">
-                  Couldn&apos;t answer
-                  {turn.error ? `: ${turn.error}` : '.'}
-                </div>
-              ) : null}
+              {renderTurnAnswer(turn)}
             </div>
           ))}
         </div>

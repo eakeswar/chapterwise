@@ -26,10 +26,10 @@ Textbook PDF → ordered topics (chapters/sections/subsections) + per-topic expl
 | **1** | Backend `/upload_pdf` + `pdf_extract.py` (per-page text + images) | ✅ Done |
 | **2** | Backend `/build_topics` + `topic_builder.py` (ordered tree; **regex default**, optional LLM) | 🟡 Partial — **regex TOC works** (full Class 9 Science 1299 pp → 223 topics / 214 headings in **0.16s**); title/order still OCR-noisy; **full-book false `Chapter N` hits** (duplicate/out-of-order chapter nodes); LLM path kept behind `CHAPTERWISE_TOPIC_BUILDER=llm` |
 | **3** | Frontend `UploadPanel` + `TopicTree` wired to upload + build_topics | ✅ Done — wired; **sidebar inner-scrolls** (`.app-shell` `height: 100vh; overflow: hidden`; `.topic-tree-list` `flex:1; min-height:0; overflow: auto`) |
-| **4** | Backend `/topic/{id}` + Frontend `TopicView` (explanation + image gallery) | 🟡 Partial — LLM explanation + Listen ✅; **deferred image b64** + on-demand encode; gallery **drops `isBackground`**; markdown explanation/answers; enhance wired (step 7) |
-| **5** | Backend `/ask` + Frontend `AskPanel` (grounded Q&A) | ✅ Done — `qa.py` + `POST /ask` + floating **Ask** drawer (`AskPanel`); chat thread + composer; clears on topic switch; no Q&A cache |
-| **6** | Backend `/tts` + Listen button in `TopicView` | ✅ Done — `/tts` + Listen; default voice **`shimmer`** (female); narrates explanation (falls back to source text) |
-| **7** | Backend `image_enhance.py` (informational → Lanczos, decorative → gpt-image-2) | 🟡 Partial — **wired**: cheap classify + baked-text OCR; informational → Lanczos; decorative → **on-demand** `POST .../generate` (gpt-image-2). `overlapWordCount` still **0 on RapidOCR extract path** (ignored as a gate). |
+| **4** | Backend `/topic/{id}` + Frontend `TopicView` (explanation + image gallery) | 🟡 Partial — **SSE-streamed** LLM explanation; Listen + **voice picker**; deferred image b64; gallery drops `isBackground`; markdown when complete; source card **collapsed by default**; enhance wired (step 7) |
+| **5** | Backend `/ask` + Frontend `AskPanel` (grounded Q&A) | ✅ Done — `qa.py` + **SSE** `POST /ask` + FAB drawer; chat thread streams answers; clears on topic switch; no Q&A cache |
+| **6** | Backend `/tts` + Listen button in `TopicView` | ✅ Done — `/tts` + Listen; default **`shimmer`**; UI picker (10 confirmed voices); persists across topic switches in the session |
+| **7** | Backend `image_enhance.py` (informational → Lanczos, decorative → gpt-image-2) | 🟡 Partial — cheap classify + baked-text OCR; informational → Lanczos; decorative **Generate HD** uses **`images.edit`** (source bytes, `input_fidelity=high`); vision+`images.generate` only if edits fails. `overlapWordCount` still 0 on RapidOCR extract. |
 | **8** | End-to-end polish; revisit `# TODO v2` items | ⬜ Not started |
 
 **When continuing work:** follow this order. Do one step at a time unless the user explicitly asks for multiple steps. Get user test approval between major steps when they ask for that workflow.
@@ -48,10 +48,10 @@ chapterwise/
     text_provider.py           ← TEXT_PROVIDER routing (Azure chat / Kaggle Llama)
     pdf_extract.py             ← Per-page text + image extraction
     topic_builder.py           ← ordered topic tree (regex headings default; optional LLM)
-    topic_detail.py            ← Topic payload + LLM explanation + on-demand image b64 + generate
-    qa.py                      ← grounded /ask (step 5) ✅
-    tts.py                     ← Azure TTS (step 6) ✅ default voice shimmer
-    image_enhance.py           ← classify + Lanczos + on-demand gpt-image-2 (step 7)
+    topic_detail.py            ← Topic payload (no LLM on GET) + SSE explanation stream + on-demand image b64
+    qa.py                      ← grounded SSE /ask (step 5) ✅
+    tts.py                     ← Azure TTS (step 6) ✅ default shimmer; TTS_VOICES allowlist
+    image_enhance.py           ← classify + Lanczos + on-demand gpt-image-2 **edits** (step 7)
     security.py                ← PDF validation, CORS, size limits
     requirements.txt
     .env                       ← secrets (gitignored; copy from .env.example)
@@ -72,7 +72,8 @@ chapterwise/
     vite.config.js
     src/
       config/api.js            ← API base URL only here
-      utils/apiClient.js
+      utils/apiClient.js       ← fetch + SSE consumeSse
+      utils/mergeTopicPoll.js  ← keep streaming explanation across classify polls
       context/DocContext.jsx
       components/
         UploadPanel.jsx        ← step 3 ✅
@@ -99,10 +100,11 @@ chapterwise/
 | GET | `/health` | Health check (+ Kaggle reachability, `text_provider`, LLM status) |
 | POST | `/upload_pdf` | Save PDF, extract pages; optional `?page_start=&page_end=`; returns `timing` (receive/extract/total seconds) |
 | POST | `/build_topics` | Build topic tree (default: heading regex; optional LLM). Returns `builder`, `timing.total_seconds` |
-| GET | `/topic/{topic_id}` | Topic metadata, source text, LLM explanation, images (encode deferred xrefs on demand; skip `isBackground`; enhance classify) |
-| POST | `/topic/{topic_id}/images/{image_id}/generate` | On-demand gpt-image-2 for **decorative + classify_status=ready** only; 400 if informational/pending |
-| POST | `/ask` | `{ topic_id, question }` grounded answer (`status`: ready \| failed) |
-| POST | `/tts` | `{ text, voice? }` → MP3 audio (default voice `shimmer`) |
+| GET | `/topic/{topic_id}` | Topic metadata, source, images, cached explanation if any. **Does not call the LLM.** `explanation_status`: ready \| pending \| skipped |
+| GET | `/topic/{topic_id}/explanation/stream` | SSE explanation (`delta` / `done` / `error`). Caches full text only on `done` |
+| POST | `/topic/{topic_id}/images/{image_id}/generate` | On-demand gpt-image-2 **edit** for **decorative + classify_status=ready** only; 400 if informational/pending |
+| POST | `/ask` | SSE grounded answer `{ topic_id, question }` (`delta` / `done` / `error`) |
+| POST | `/tts` | `{ text, voice? }` → MP3 (default `shimmer`; allowlist in `tts.py`) |
 | GET | `/debug/text` | Smoke-test text provider (Kaggle Llama or Azure chat) |
 | GET | `/debug/azure` | Smoke-test TTS and image Azure deployments |
 | GET | `/debug/extraction` | Per-page extraction summary |
@@ -185,8 +187,8 @@ chapterwise/
 
 - **UploadPanel:** PDF upload → `/upload_pdf` → `/build_topics`; optional “Test first pages only” passes `?page_start=1&page_end=N` to **upload** (partial extract) and build_topics; shows upload/extract + build timing after success
 - **TopicTree:** Collapsible chapter → section → subsection; **never re-sort** client-side. Not virtualized. Default opens first chapter only. Sidebar list **inner-scrolls** (`.app-shell` `height: 100vh; overflow: hidden`; `.topic-tree-list` `overflow: auto`).
-- **TopicView:** Fetches `GET /topic/{id}`; **full-width** main column (`.main-panel--topic`) with stacked **section cards** (Explanation, Source text, Images) in `.topic-view-scroll`. **Markdown** explanation (`MarkdownText`); **Listen** → `POST /tts` (primary button in header). Image gallery (no backgrounds); informational/pending → no Generate HD; decorative + `classify_status=ready` → **Generate HD**; polls `/topic` every 3s while classify pending. **Ask is not inline** — floating **FAB** (`.ask-fab`, bottom-right) opens overlay **drawer** (`.ask-drawer`) with chat history + composer.
-- **AskPanel:** `AskComposer` (auto-grow textarea + inline send icon); `POST /ask`; **multi-turn thread** (`turns[]`, question + answer pairs); `layout="column"` inside drawer; clears `turns` + input on `topicId` change; drawer also closes on topic switch (`TopicView` `askOpen` reset).
+- **TopicView:** Fetches `GET /topic/{id}` (fast: no LLM). If `explanation_status=pending`, opens SSE `/explanation/stream`. Plain text + cursor while streaming; **Markdown** after `ready`. Incomplete stream keeps partial text + notice; **not** cached. Classify poll every 3s **merges** via `mergeTopicPoll` (does not wipe in-progress explanation). **Source text** card collapsed by default (`Source text (N chars)` + chevron); expands in place; resets collapsed on topic switch. **Listen** + **voice `<select>`** (default shimmer; `useState` survives topic switches). Gallery: informational/pending → no Generate HD; decorative + `classify_status=ready` → **Generate HD**. **Ask** = FAB + overlay drawer.
+- **AskPanel:** `AskComposer`; **SSE** `POST /ask`; thread `turns[]` with streaming / incomplete / ready / failed; clears on `topicId` change; drawer closes on topic switch.
 - **UploadLoadingScreen:** Animated main-panel loading during upload/build (shimmer progress bar + step labels + **live elapsed timer** + layout preview)
 - **DocContext:** `topicTree`, `activeTopicId`, `topicCache`, `uploadTiming`, `buildTiming`, upload/build phases
 - **App.jsx:** Sidebar + `TopicView` or `UploadLoadingScreen` in main panel
@@ -252,7 +254,7 @@ cd frontend && npm install
 - **2026-08-14 — On-demand image encode:** `GET /topic/{id}` hydrates missing `url`s via `encode_xref_data_url()` for that topic’s xrefs only; in-memory cache `{pdf fingerprint}:{xref}`. `jpx`/`jp2`/etc. converted to PNG (Separation/CMYK pixmaps go through RGB). Gallery **excludes `isBackground`** (page-2 Activity 1.3/1.4/1.5 duplicate galleries were only backgrounds). Images still attach by **page range only**; heading `start` char offsets are dropped after TOC build. Same-page sibling non-bg sharing still exists but is rare on pp.1–8 (e.g. one figure on p.3 shared by Activity 1.6/1.7/1.8). Position-based split **not built**.
 - **2026-08-14 — Step 5 Q&A:** `qa.py` `answer_question()` + `POST /ask` `{ topic_id, question }`. Context = cached explanation (if any) + page-range source. System prompt: answer only from context, else say this section does not have enough information. HTTP 200 + `status=failed` on provider error (same fail-fast as `/topic`). `AskPanel` in `TopicView`. Smoke: Activity 1.1 → “Panch Tatva”; boiling point of water refused.
 - **2026-08-14 — Full-book TOC + UI:** `/build_topics` on 1299 pp → **223 topics / 214 headings / 0.16s**. Regex false `Chapter N` matches → 37 chapter nodes, duplicate/out-of-order titles (e.g. several “Chapter 6”, last “Chapter 8” at pp.1290–1299 is likely answers/appendix). Start/mid/end `/topic` + `/ask` + Listen worked (Activity 1.1 p.1, Activity 8.4 p.650, ch37 pp.1290–1299). TTS default voice **`shimmer`**.
-- **2026-08-14 — TTS voice:** `tts.py` `DEFAULT_VOICE = "shimmer"` (female). Listen does not pass `voice`, so this default applies. Restart backend after the change (clears in-memory extract).
+- **2026-08-14 — TTS voice:** `tts.py` `DEFAULT_VOICE = "shimmer"` (female). **Superseded 2026-08-20:** Listen now sends the picker voice (still defaults to shimmer).
 - **2026-08-17 — Black gallery images (SMask):** Page-1-style 1-bit ICC Gray + **SMask** decoded as raw PNG looked solid black (artwork in the mask). `encode_xref_data_url()` now Pixmap-decodes unsafe/SMask/low-bpc/CMYK/Separation images to RGB PNG with mask as alpha.
 - **2026-08-17 — Step 7 on-demand generate:** `/topic` Lanczos for informational+low quality; decorative stays original unless cache already has `kind=generated`. **`POST /topic/{id}/images/{image_id}/generate`** — 400 if not decorative (`InformationalImageError`); Azure/timeout → HTTP 200 `{status: failed}`. Size `1024x1024`. Gallery: Generate HD / Show original. Do **not** auto-run gpt-image-2 on topic open (pages with many decorative images, e.g. p174).
 - **2026-08-17 — Generate prompt must follow the photo:** Vision caption describes **only** the attached pixels (no topic). gpt-image-2 prompt: redraw that caption; topic title is **style only**. Negatives: no people/vehicles/animals/tools not in the caption. Including chapter explanation as subject turned “wheat grains” (p684) into a farm scene when generated from **`ch20` (Chapter 12)** instead of `ch20_s1_ss1`.
@@ -262,6 +264,10 @@ cd frontend && npm install
 - **2026-08-19 — Topic view polish (`4ba796f`):** Docked ask panel at bottom of topic view (scroll body + pinned footer); **section cards** + stronger `h2` hierarchy; primary **Listen** styling; removed `.topic-view { max-width: 920px }` so main panel spans full width; **ChatGPT-style composer** (`.ask-composer`, auto-grow textarea, send icon inside bordered box).
 - **2026-08-19 — Ask layout experiments (reverted except C):** Tried three right-panel patterns on same stacked middle content — **(A)** top tabs (Explanation/Source/Images/Ask) + slim bottom audio bar; **(B)** persistent ~380px Ask column (+ drawer below 1200px); **(C)** **current:** full-width middle + floating **FAB** + overlay drawer (no fixed third column). Commits: `4ba796f` (dock baseline) → `0e6ed8d` (FAB drawer + `AskComposer` refactor + chat thread).
 - **2026-08-19 — Floating Ask drawer (current UI, `0e6ed8d`):** `.ask-fab` fixed bottom-right; `.ask-drawer` overlays content (backdrop, ×, or FAB toggle to close); `AskPanel` `turns[]` thread with pending/ready/failed states; topic switch resets drawer open state + chat history.
+- **2026-08-20 — Streamed explanation + Ask:** `GET /topic/{id}` no longer calls the LLM (returns `pending` unless cached). `GET /topic/{id}/explanation/stream` and `POST /ask` are **SSE** (`event: delta|done|error`). Azure `chat.completions.create(stream=True)`; Kaggle still one-shot (yields the full string). Cache explanation only after a complete `done`. Fail-soft: partial text + “may be incomplete”; truncated text is **not** cached. Frontend: raw text + blinking cursor while streaming; `MarkdownText` when ready. Classify-poll `GET /topic` mid-stream must use `mergeTopicPoll` (polls return `explanation: null` until cache is ready). Debug: `CHAPTERWISE_STREAM_FAIL_AFTER_CHARS`, `CHAPTERWISE_STREAM_CHUNK_DELAY_MS` (leave unset in normal `.env`).
+- **2026-08-20 — TTS voice picker:** Confirmed `gpt-4o-mini-tts` voices (all 200 MP3): alloy, echo, fable, onyx, nova, **shimmer**, coral, ash, sage, verse. `tts.py` `TTS_VOICES` allowlist; UI select defaults to **shimmer**; `synthesizeSpeech(text, voice)` sends `voice` on `POST /tts`. Voice state lives in `TopicView` (not reset on topic switch).
+- **2026-08-20 — Source text collapsed by default:** Header `Source text (N chars)` + `▸`/`▾`; click to expand the existing `<pre className="topic-source">`. `sourceOpen` resets on topic switch.
+- **2026-08-20 — Generate HD uses `images.edit`:** Live probe: `client.images.edit` on edzhub `gpt-image-2` (`…/openai/v1/images/edits`) returns b64 PNG (`input_fidelity=high` accepted). `generate_decorative_image(..., source_bytes=)` edits the real photo with a quality-only prompt; vision caption + `images.generate` only if edits errors. Smoke: page-3 tribal-dress group and page-684 grain pile stayed subject-faithful (not generic dress / not a farm scene). Samples in `backend/test_output/hd_compare/` (gitignored). `chapterwise-text` is chat-only — images stay on edzhub.
 
 ---
 
@@ -296,6 +302,9 @@ CHAPTERWISE_RAPIDOCR_FORCE=0
 CHAPTERWISE_DEBUG_TIMING=0
 # Skip eager image base64 during extract (encode on /topic). Set 0 to restore old behavior.
 CHAPTERWISE_DEFER_IMAGE_B64=1
+# Stream debug only (unset in normal use): fail after N chars; delay ms per chunk
+# CHAPTERWISE_STREAM_FAIL_AFTER_CHARS=80
+# CHAPTERWISE_STREAM_CHUNK_DELAY_MS=50
 BLUR_VARIANCE_THRESHOLD=100
 SMALL_IMAGE_MIN_DIM=400
 
@@ -349,34 +358,35 @@ Frontend `.env` optional: `VITE_API_BASE_URL=http://127.0.0.1:8766`
 
 - ✅ Join topic node from `topics_by_id` with page-range slice of `_active_extraction`
 - ✅ Source text + image gallery in `TopicView`
-- ✅ LLM explanation via `text_provider.chat_completion` in `topic_detail.py` (`explanation_status`: ready | skipped | failed)
-- ✅ Listen button via `POST /tts` (narrates explanation, falls back to source text)
+- ✅ LLM explanation via SSE stream (`pending` on GET until cached; `ready` | `skipped` | `failed` | `incomplete`)
+- ✅ Listen button via `POST /tts` (narrates explanation, falls back to source text); voice picker default shimmer
 - ✅ Deferred extract b64; `/topic` encodes on demand; gallery skips `isBackground`
 - ✅ Images run through `image_enhance.py` on `/topic` (cheap classify + background baked-text OCR; Lanczos for informational+low quality)
-- ✅ On-demand decorative generate: `POST /topic/{id}/images/{image_id}/generate`
+- ✅ Source text card collapsed by default
+- ✅ On-demand decorative HD: `POST /topic/{id}/images/{image_id}/generate` → `images.edit`
 - ⬜ Optional: assign non-bg images to same-page sibling topics via heading offset vs image `y` (deferred — rare on Class 9 pp.1–8)
 - `# TODO v2`: richer formula vs decorative classification; compute `overlapWordCount` on RapidOCR extract path (PyMuPDF words) if we want overlap as an informational shortcut again
 
 ### `/ask` + `AskPanel`
 
-- ✅ `qa.py` + `POST /ask` + `AskPanel` (explanation + source in context; refuse outside topic)
+- ✅ `qa.py` + SSE `POST /ask` + `AskPanel` (explanation + source in context; refuse outside topic)
 - ⬜ No Q&A cache (v1: every question is a fresh call)
 
 ### `/tts` + Listen
 
 - ✅ `tts.py` + `POST /tts` on `AZURE_TTS_BASE_URL` (services endpoint)
 - ✅ Listen button in `TopicView` (explanation text, fallback to source text)
-- ✅ Default voice **`shimmer`**
+- ✅ Default voice **`shimmer`**; UI picker + `TTS_VOICES` allowlist
 - ⬜ Optional: `POST /tts` with `{ topic_id }` after explanation exists
 
 ### `image_enhance.py` (§4a)
 
-- ✅ `generate_decorative_image()` via `gpt-image-2` (size `1024x1024`)
+- ✅ `generate_decorative_image()` via `gpt-image-2` **`images.edit`** (source PNG, `input_fidelity=high`, size `1024x1024`); `images.generate` fallback only
 - ✅ Cheap classify: aspect ≥ 2.2 or gray/line-art (mean chroma under 25) → informational. **`overlapWordCount` is not a gate** (RapidOCR extract always stores 0).
 - ✅ Baked-text OCR (RapidOCR on image pixels, downscaled max 512): if would-be decorative, run **in background**; ≥1 decent string → informational. Until `classify_status=ready`, treat as informational (no Generate HD).
 - ✅ Quality: small (`SMALL_IMAGE_MIN_DIM=400`) or blurry (Laplacian under `BLUR_VARIANCE_THRESHOLD=100`)
 - ✅ Route: informational + low quality → **Lanczos**; decorative → original until user **Generate HD** (never gpt-image-2 formulas/diagrams)
-- ✅ Prompt: vision describes the photo only; generate prompt is caption-primary + style from topic **title** only (no explanation dump)
+- ✅ Edit prompt: quality-only (sharpen/upscale; do not change people, clothes, patterns, poses). Vision+generate fallback still uses caption-primary + topic **title** as style only
 - ✅ In-memory `_ENHANCE_CACHE` keyed by source SHA-256 (includes classify result; decorative originals are cached so OCR does not rerun)
 - Do **not** auto-generate decorative images on `/topic` (too many per page; Azure cost + latency)
 
@@ -406,7 +416,8 @@ Frontend `.env` optional: `VITE_API_BASE_URL=http://127.0.0.1:8766`
 - **Large PDFs (e.g. 300 MB):** Browser sends full file to laptop every upload. “Test first pages only” limits **extract** page range, not upload size. Kaggle path uploads all 76×4 MB chunks before extract. Local **full-book** extract of Class 9 Science (1299 pp / 301 MB) ≈ **3.5 min** with defer-b64 + RapidOCR (was ~4.8 min with eager b64). Partial 15–20 pages ≈ 3–5 min was the old pdfplumber-era figure — RapidOCR + header-sample cache is much faster for small ranges (~6–8s for pp.1–10).
 - **Full-book regex TOC:** 223 topics in 0.16s, but many false `Chapter N` headings (duplicate/out-of-order chapter nodes). Title spill / two-column OCR order still present on early pages.
 - **`overlapWordCount` is unused on laptop RapidOCR extracts** (2732/2732 were 0 on Class 9 Science). Color diagrams with labels painted into the JPEG (p68 xylem/phloem) need baked-text OCR, not PDF overlap.
-- **Generate HD from a chapter node** (`ch20` = whole Chapter 12) used to illustrate the **topic**, not the photo. Generate from the tight subsection when possible; prompt no longer injects explanation as subject.
+- **Generate HD (edits path, 2026-08-20):** Prefer Generate HD after classify is ready. Generations-only used to invent scenes (p684 wheat → farm; costume photos → generic dress). Current path sends source bytes to `images.edit`. Still avoid generating from a whole-chapter node when a tighter subsection exists.
+- **Streaming + classify poll:** `GET /topic` during OCR poll returns `explanation: null` until the stream caches. Frontend must merge; do not `setDetail(pollPayload)` raw.
 - Only one upload/build at a time (`_extraction_lock`); backend blocks `/health` during active job
 - **Port 8766 in use:** Stop prior `python backend/main.py` (Ctrl+C) before restarting
 - Restart backend after `.env` changes; restart clears in-memory extraction/topics/explanations
@@ -418,6 +429,6 @@ Frontend `.env` optional: `VITE_API_BASE_URL=http://127.0.0.1:8766`
 
 ## 12. Next step when user says “continue”
 
-**Next:** (1) Tighten regex TOC for full-book false `Chapter N` hits / title spill / two-column order. (2) Pick final Ask UX if FAB drawer needs tweaks (tabs/column variants were tried 2026-08-19). (3) Optional: compute `overlapWordCount` on RapidOCR extract path. (4) Optional later: same-page non-bg image split by heading offset vs `y`. (5) `# TODO v2`: skip Kaggle upload when page range set; background extract; disk cache.
+**Next:** (1) Tighten regex TOC for full-book false `Chapter N` hits / title spill / two-column order. (2) Optional Ask UX tweaks (FAB drawer is current). (3) Optional: compute `overlapWordCount` on RapidOCR extract path. (4) Optional later: same-page non-bg image split by heading offset vs `y`. (5) `# TODO v2`: skip Kaggle upload when page range set; background extract; disk cache.
 
-**Dev defaults (2026-08-19):** `EXTRACT_PROVIDER=local`, `CHAPTERWISE_TOPIC_BUILDER=regex`, `TEXT_PROVIDER=azure` (`gpt-4.1-mini` via `AZURE_CHAT_*`), `CHAPTERWISE_TEXT_EXTRACTOR=rapidocr`, `CHAPTERWISE_DEFER_IMAGE_B64=1`, TTS voice **`shimmer`**, decorative gpt-image-2 **on-demand only**, Ask UI = **FAB + overlay drawer**. Kaggle optional.
+**Dev defaults (2026-08-20):** `EXTRACT_PROVIDER=local`, `CHAPTERWISE_TOPIC_BUILDER=regex`, `TEXT_PROVIDER=azure` (`gpt-4.1-mini` via `AZURE_CHAT_*`), `CHAPTERWISE_TEXT_EXTRACTOR=rapidocr`, `CHAPTERWISE_DEFER_IMAGE_B64=1`, TTS default **`shimmer`** (picker), decorative HD = **on-demand `images.edit`**, Ask UI = **FAB + overlay drawer**, explanations/Ask **SSE-streamed**. Kaggle optional.

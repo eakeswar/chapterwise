@@ -64,23 +64,91 @@ export async function fetchTopic(topicId) {
   return response.json()
 }
 
-export async function askQuestion(topicId, question) {
-  const response = await fetch(API.ask, {
-    method: 'POST',
-    headers: apiHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ topic_id: topicId, question }),
-  })
+function parseSseBlock(block) {
+  let event = 'message'
+  const dataLines = []
+  for (const line of block.split('\n')) {
+    if (line.startsWith('event:')) event = line.slice(6).trim()
+    else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
+  }
+  const raw = dataLines.join('\n')
+  let data = {}
+  if (raw) {
+    try {
+      data = JSON.parse(raw)
+    } catch {
+      data = { text: raw }
+    }
+  }
+  return { event, data }
+}
+
+function dispatchSseBlock(block, handlers) {
+  if (!block.trim() || block.startsWith(':')) return
+  const { event, data } = parseSseBlock(block)
+  if (event === 'delta' && data.text) handlers.onDelta?.(data.text)
+  else if (event === 'done') handlers.onDone?.(data)
+  else if (event === 'error') handlers.onError?.(data)
+}
+
+export async function consumeSse(response, handlers = {}) {
   if (!response.ok) {
     throw new Error(await parseError(response))
   }
-  return response.json()
+  if (!response.body) {
+    throw new Error('No response body to stream')
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  try {
+    while (true) {
+      if (handlers.signal?.aborted) {
+        await reader.cancel()
+        throw new DOMException('Aborted', 'AbortError')
+      }
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const parts = buffer.split('\n\n')
+      buffer = parts.pop() ?? ''
+      for (const part of parts) dispatchSseBlock(part, handlers)
+    }
+    buffer += decoder.decode()
+    if (buffer.trim()) dispatchSseBlock(buffer, handlers)
+  } finally {
+    reader.releaseLock?.()
+  }
 }
 
-export async function synthesizeSpeech(text) {
+export async function streamTopicExplanation(topicId, handlers = {}) {
+  const response = await fetch(API.topicExplanationStream(topicId), {
+    headers: apiHeaders({ Accept: 'text/event-stream' }),
+    signal: handlers.signal,
+  })
+  await consumeSse(response, handlers)
+}
+
+export async function streamAskQuestion(topicId, question, handlers = {}) {
+  const response = await fetch(API.ask, {
+    method: 'POST',
+    headers: apiHeaders({
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+    }),
+    body: JSON.stringify({ topic_id: topicId, question }),
+    signal: handlers.signal,
+  })
+  await consumeSse(response, handlers)
+}
+
+export async function synthesizeSpeech(text, voice = 'shimmer') {
   const response = await fetch(API.tts, {
     method: 'POST',
     headers: apiHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({ text, voice }),
   })
   if (!response.ok) {
     throw new Error(await parseError(response))

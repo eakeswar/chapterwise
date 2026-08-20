@@ -17,6 +17,11 @@ LINE_ART_MAX_CHROMA = 25.0
 DEFAULT_SMALL_MIN_DIM = 400
 DEFAULT_BLUR_VARIANCE = 100.0
 GENERATED_IMAGE_SIZE = "1024x1024"
+DECORATIVE_EDIT_PROMPT = (
+    "Increase resolution and sharpness of this image. Do not change the people, "
+    "their clothing, clothing colors, patterns, poses, or any other visual details "
+    "— enhance quality only, preserve the exact subject as shown."
+)
 VISION_MAX_SIDE = 768
 OCR_MAX_SIDE = 512
 BAKED_TEXT_MIN_LEN = 2
@@ -58,15 +63,24 @@ def blur_variance_threshold() -> float:
         return DEFAULT_BLUR_VARIANCE
 
 
-def generate_decorative_image(prompt: str, *, size: str = GENERATED_IMAGE_SIZE) -> str:
-    """Generate a decorative image and return base64 PNG data."""
+def generate_decorative_image(
+    prompt: str,
+    *,
+    size: str = GENERATED_IMAGE_SIZE,
+    source_bytes: bytes | None = None,
+) -> str:
+    """Return base64 PNG. Prefers images.edit when source bytes are provided."""
     cleaned = (prompt or "").strip()
     if not cleaned:
         raise ValueError("Prompt is required for image generation.")
 
     client = get_images_client()
+    model = get_image_deployment()
+    if source_bytes:
+        return _edit_decorative_image(client, model, source_bytes, cleaned, size)
+
     response = client.images.generate(
-        model=get_image_deployment(),
+        model=model,
         prompt=cleaned,
         size=size,
         n=1,
@@ -74,6 +88,46 @@ def generate_decorative_image(prompt: str, *, size: str = GENERATED_IMAGE_SIZE) 
     item = response.data[0]
     if not getattr(item, "b64_json", None):
         raise ValueError("Image model did not return base64 data.")
+    return item.b64_json
+
+
+def _png_file_for_edit(source_bytes: bytes) -> io.BytesIO:
+    from PIL import Image
+
+    pil = Image.open(io.BytesIO(source_bytes))
+    if pil.mode not in ("RGB", "RGBA"):
+        pil = pil.convert("RGBA") if "A" in pil.mode else pil.convert("RGB")
+    buffer = io.BytesIO()
+    pil.save(buffer, format="PNG")
+    buffer.seek(0)
+    buffer.name = "source.png"
+    return buffer
+
+
+def _edit_decorative_image(
+    client: Any,
+    model: str,
+    source_bytes: bytes,
+    prompt: str,
+    size: str,
+) -> str:
+    image_file = _png_file_for_edit(source_bytes)
+    kwargs = {
+        "model": model,
+        "image": image_file,
+        "prompt": prompt,
+        "size": size,
+        "n": 1,
+    }
+    try:
+        response = client.images.edit(**kwargs, input_fidelity="high")
+    except Exception as exc:
+        print(f"images.edit input_fidelity=high failed ({exc}); retrying without it.")
+        image_file.seek(0)
+        response = client.images.edit(**kwargs)
+    item = response.data[0]
+    if not getattr(item, "b64_json", None):
+        raise ValueError("Image edit did not return base64 data.")
     return item.b64_json
 
 
@@ -202,24 +256,32 @@ def generate_decorative_on_demand(
     from PIL import Image
 
     try:
-        pil = Image.open(io.BytesIO(source_bytes))
-        vision_caption = _caption_source_image(data_url, pil)
-        prompt = _build_decorative_generation_prompt(
-            vision_caption,
-            topic_title=topic_title,
+        b64_png = generate_decorative_image(
+            DECORATIVE_EDIT_PROMPT,
+            source_bytes=source_bytes,
         )
-        print(f"Decorative vision caption ({digest[:12]}…): {vision_caption}")
-        print(f"Decorative generate prompt ({digest[:12]}…): {prompt}")
-        b64_png = generate_decorative_image(prompt)
-    except Exception as exc:
-        print(f"Decorative image generation failed for {digest[:12]}…: {exc}")
-        return {
-            "status": "failed",
-            "error": str(exc) or exc.__class__.__name__,
-            "url": data_url,
-            "ext": _ext_from_data_url(data_url),
-            "kind": "original",
-        }
+        print(f"Decorative HD via images.edit ({digest[:12]}…)")
+    except Exception as edit_exc:
+        print(f"Decorative images.edit failed for {digest[:12]}… ({edit_exc}); falling back to vision + generate.")
+        try:
+            pil = Image.open(io.BytesIO(source_bytes))
+            vision_caption = _caption_source_image(data_url, pil)
+            prompt = _build_decorative_generation_prompt(
+                vision_caption,
+                topic_title=topic_title,
+            )
+            print(f"Decorative vision caption ({digest[:12]}…): {vision_caption}")
+            print(f"Decorative generate prompt ({digest[:12]}…): {prompt}")
+            b64_png = generate_decorative_image(prompt)
+        except Exception as exc:
+            print(f"Decorative image generation failed for {digest[:12]}…: {exc}")
+            return {
+                "status": "failed",
+                "error": str(exc) or exc.__class__.__name__,
+                "url": data_url,
+                "ext": _ext_from_data_url(data_url),
+                "kind": "original",
+            }
 
     generated_url = f"data:image/png;base64,{b64_png}"
     payload = {
