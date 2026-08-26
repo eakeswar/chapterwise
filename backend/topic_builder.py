@@ -84,7 +84,46 @@ def _looks_like_section_title(title: str) -> bool:
     return upper_ratio >= 0.45
 
 
-def _scan_page_headings(page_num: int, text: str) -> list[dict[str, Any]]:
+def _y_for_heading(
+    number: str,
+    keyword: str | None,
+    line_boxes: list[dict[str, Any]] | None,
+) -> float | None:
+    """Top-down y (PDF points) of the physical line a heading was found on.
+
+    Content-matched (not offset-matched): `line_boxes` comes from a
+    separate PyMuPDF/RapidOCR box pass and is not guaranteed to align
+    character-for-character with the regex-scanned page text, so this
+    searches for the heading's distinctive number token instead. Heuristic,
+    not exact — prefers lines where the number appears near the start
+    (typical heading position) and, when given, a matching keyword
+    (e.g. "Activity", "Chapter").
+    """
+    if not line_boxes or not number:
+        return None
+    needle = number.strip()
+    if not needle:
+        return None
+
+    scored: list[tuple[tuple[int, int, int], dict[str, Any]]] = []
+    for line in line_boxes:
+        text = line.get("text") or ""
+        idx = text.find(needle)
+        if idx < 0:
+            continue
+        has_keyword = 0 if (keyword and keyword.lower() in text.lower()) else 1
+        starts_early = 0 if idx <= 3 else 1
+        scored.append(((has_keyword, starts_early, idx), line))
+
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0])
+    return float(scored[0][1].get("y0", 0.0))
+
+
+def _scan_page_headings(
+    page_num: int, text: str, line_boxes: list[dict[str, Any]] | None = None
+) -> list[dict[str, Any]]:
     """Find heading-like matches on one page (document order by start index)."""
     if not text or not text.strip():
         return []
@@ -100,6 +139,7 @@ def _scan_page_headings(page_num: int, text: str) -> list[dict[str, Any]]:
                 "title": f"Chapter {num}",
                 "page": page_num,
                 "start": match.start(),
+                "heading_y": _y_for_heading(num, "Chapter", line_boxes),
                 "kind": "chapter",
             }
         )
@@ -114,6 +154,7 @@ def _scan_page_headings(page_num: int, text: str) -> list[dict[str, Any]]:
                 "page": page_num,
                 "start": match.start(),
                 "end": match.end(),
+                "heading_y": _y_for_heading(num, "Activity", line_boxes),
                 "kind": "activity",
             }
         )
@@ -134,6 +175,7 @@ def _scan_page_headings(page_num: int, text: str) -> list[dict[str, Any]]:
                 "page": page_num,
                 "start": match.start(),
                 "end": match.end(),
+                "heading_y": _y_for_heading(num, "Activity", line_boxes),
                 "kind": "activity",
             }
         )
@@ -150,6 +192,7 @@ def _scan_page_headings(page_num: int, text: str) -> list[dict[str, Any]]:
                 "title": f"{num} {title}",
                 "page": page_num,
                 "start": match.start(),
+                "heading_y": _y_for_heading(num, None, line_boxes),
                 "kind": "subsection",
             }
         )
@@ -168,6 +211,7 @@ def _scan_page_headings(page_num: int, text: str) -> list[dict[str, Any]]:
                 "title": f"{num} {title}",
                 "page": page_num,
                 "start": match.start(),
+                "heading_y": _y_for_heading(num, None, line_boxes),
                 "kind": "section",
             }
         )
@@ -191,7 +235,9 @@ def extract_headings(pages: list[dict[str, Any]], page_start: int, page_end: int
         page_num = int(page["page"])
         if page_num < page_start or page_num > page_end:
             continue
-        headings.extend(_scan_page_headings(page_num, page.get("text") or ""))
+        headings.extend(
+            _scan_page_headings(page_num, page.get("text") or "", page.get("line_boxes"))
+        )
     return headings
 
 
@@ -232,6 +278,10 @@ def _ensure_chapter(chapters: list[dict[str, Any]], page_start: int, page_end: i
         "title": f"Pages {page_start}–{page_end}",
         "page_start": page_start,
         "page_end": page_end,
+        # No real heading for this synthetic node; treat as "starts at the
+        # top of the page" so it still participates in same-page image
+        # matching (anything before the first real heading belongs here).
+        "heading_y": 0.0,
         "sections": [],
     }
     chapters.append(chapter)
@@ -252,6 +302,9 @@ def _ensure_section(
         "title": title,
         "page_start": page_start,
         "page_end": page_end,
+        # Synthetic "Introduction" section has no real heading; see
+        # _ensure_chapter for why this defaults to top-of-page.
+        "heading_y": 0.0,
         "subsections": [],
     }
     sections.append(section)
@@ -293,6 +346,7 @@ def build_tree_from_headings(
                 "title": title,
                 "page_start": page_s,
                 "page_end": page_e,
+                "heading_y": heading.get("heading_y"),
                 "sections": [],
             }
             chapters.append(current_chapter)
@@ -310,6 +364,7 @@ def build_tree_from_headings(
                 "title": title,
                 "page_start": page_s,
                 "page_end": page_e,
+                "heading_y": heading.get("heading_y"),
                 "subsections": [],
             }
             current_chapter["sections"].append(current_section)
@@ -330,6 +385,7 @@ def build_tree_from_headings(
                 "title": title,
                 "page_start": page_s,
                 "page_end": page_e,
+                "heading_y": heading.get("heading_y"),
             }
         )
         current_section["page_end"] = max(int(current_section["page_end"]), page_e)
@@ -777,6 +833,7 @@ def flatten_topics(tree: dict[str, Any]) -> dict[str, dict[str, Any]]:
             "page_end": node["page_end"],
             "level": level,
             "parent_id": parent_id,
+            "heading_y": node.get("heading_y"),
         }
 
     for chapter in tree.get("chapters") or []:

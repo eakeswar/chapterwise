@@ -133,15 +133,68 @@ def _hydrate_deferred_image_urls(
                 image["url"] = cached[1]
 
 
+def _sibling_topics_on_page(
+    topics_by_id: dict[str, Any], page_num: int
+) -> list[dict[str, Any]]:
+    """Topics whose entire range is this single page (candidates for the
+    same-page "closest heading above" image split)."""
+    return [
+        topic
+        for topic in topics_by_id.values()
+        if int(topic.get("page_start", -1)) == page_num
+        and int(topic.get("page_end", -2)) == page_num
+    ]
+
+
+def _closest_heading_topic_id(
+    image_y_top: float, siblings: list[dict[str, Any]]
+) -> str | None:
+    """Id of the sibling topic whose heading sits nearest above (<=) the
+    image; falls back to the topic with the smallest heading_y if the image
+    sits above every heading on the page."""
+    with_y = [s for s in siblings if s.get("heading_y") is not None]
+    if not with_y:
+        return None
+    above = [s for s in with_y if float(s["heading_y"]) <= image_y_top]
+    if above:
+        return max(above, key=lambda s: float(s["heading_y"]))["id"]
+    return min(with_y, key=lambda s: float(s["heading_y"]))["id"]
+
+
 def _serialize_topic_images(
     pages: list[dict[str, Any]],
     pdf_path: Path | None,
+    *,
+    current_topic_id: str | None = None,
+    topics_by_id: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     images: list[dict[str, Any]] = []
     for page in pages:
+        page_num = page["page"]
+        page_height = float(page.get("height") or 0.0)
+
+        # Fail-conservative: only split when every same-page sibling has a
+        # known heading_y. If any sibling lacks it (e.g. mixed extraction
+        # paths, missing data), skip the split and keep the old
+        # include-in-all-siblings behavior for this page.
+        page_siblings: list[dict[str, Any]] = []
+        split_eligible = False
+        if current_topic_id is not None and topics_by_id:
+            page_siblings = _sibling_topics_on_page(topics_by_id, page_num)
+            split_eligible = len(page_siblings) > 1 and all(
+                s.get("heading_y") is not None for s in page_siblings
+            )
+
         for image in page.get("images") or []:
             if image.get("isBackground"):
                 continue
+
+            if split_eligible:
+                image_y_top = page_height - float(image["y"]) - float(image["h"])
+                winner_id = _closest_heading_topic_id(image_y_top, page_siblings)
+                if winner_id is not None and winner_id != current_topic_id:
+                    continue
+
             images.append(
                 {
                     "id": image["id"],
@@ -284,7 +337,12 @@ def build_topic_detail(
     page_end = int(topic["page_end"])
     pages = _pages_in_range(extraction["pages"], page_start, page_end)
     source_text = _compose_source_text(pages)
-    images = _serialize_topic_images(pages, _resolve_pdf_path(extraction))
+    images = _serialize_topic_images(
+        pages,
+        _resolve_pdf_path(extraction),
+        current_topic_id=topic_id,
+        topics_by_id=topics_by_id,
+    )
 
     explanation, explanation_status, explanation_error = _explanation_snapshot(
         topic_id,
@@ -330,7 +388,12 @@ def generate_topic_image(
     page_start = int(topic["page_start"])
     page_end = int(topic["page_end"])
     pages = _pages_in_range(extraction["pages"], page_start, page_end)
-    images = _serialize_topic_images(pages, _resolve_pdf_path(extraction))
+    images = _serialize_topic_images(
+        pages,
+        _resolve_pdf_path(extraction),
+        current_topic_id=topic_id,
+        topics_by_id=topics_by_id,
+    )
     image = next((item for item in images if item.get("id") == image_id), None)
     if not image:
         raise ValueError(f"Unknown image id: {image_id}")

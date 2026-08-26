@@ -594,38 +594,160 @@ def _get_rapidocr_pdf() -> Any:
         return _RAPIDOCR_PDF
 
 
+def _digital_page_lines(page_obj: fitz.Page) -> list[dict[str, Any]] | None:
+    """Line text + bbox for a born-digital page (PDF-point space, top-down y).
+
+    Returns None when the page has no extractable text layer (needs OCR).
+    """
+    quick_check = page_obj.get_text("text", sort=True)
+    if not quick_check or not quick_check.strip():
+        return None
+
+    # sort=True matches the reading order previously produced by
+    # get_text("text", sort=True); without it, blocks come back in
+    # content-stream order, which silently reorders headings.
+    page_dict = page_obj.get_text("dict", sort=True)
+    lines: list[dict[str, Any]] = []
+    for block in page_dict.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            if not spans:
+                continue
+            text = reconstruct_line_text(spans)
+            if not text:
+                continue
+            x0, y0, x1, y1 = line.get("bbox", (0.0, 0.0, 0.0, 0.0))
+            lines.append({"text": text, "x0": x0, "y0": y0, "x1": x1, "y1": y1})
+    return lines
+
+
+def _ocr_page_lines(rapidocr_pdf: Any, page_obj: fitz.Page, dpi: int) -> list[dict[str, Any]]:
+    """Line text + bbox for a scanned page via RapidOCR's own detection boxes.
+
+    RapidOCR box corners are in rendered-image pixel space at `dpi`;
+    converted to PDF points (72 dpi) to match `_digital_page_lines` /
+    `_extract_page_images` coordinate space. Kept top-down (y increases
+    downward) to match PyMuPDF's `line["bbox"]` convention above.
+    """
+    import cv2
+    import numpy as np
+
+    pix = page_obj.get_pixmap(dpi=dpi)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape([pix.h, pix.w, pix.n])
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    with _RAPIDOCR_LOCK:
+        preds = rapidocr_pdf.ocr_engine(img)
+
+    if preds is None or not preds.txts or preds.boxes is None:
+        return []
+
+    scale = 72.0 / dpi
+    lines: list[dict[str, Any]] = []
+    for text, box in zip(preds.txts, preds.boxes):
+        xs = [float(point[0]) for point in box]
+        ys = [float(point[1]) for point in box]
+        lines.append(
+            {
+                "text": str(text or ""),
+                "x0": min(xs) * scale,
+                "y0": min(ys) * scale,
+                "x1": max(xs) * scale,
+                "y1": max(ys) * scale,
+            }
+        )
+    return lines
+
+
+def _filter_lines(
+    lines: list[dict[str, Any]],
+    headers_footers: frozenset[str],
+) -> list[dict[str, Any]]:
+    """Apply the same drop rules as _clean_page_text, keeping bbox per
+    surviving line (positional metadata only; does not affect canonical
+    page text, which is generated independently — see callers)."""
+    kept_lines: list[dict[str, Any]] = []
+    for line in lines:
+        text = (line.get("text") or "").strip()
+        if not text:
+            continue
+        if text in headers_footers:
+            continue
+        if re.match(r"^\d+$", text):
+            continue
+        if re.match(r"^[ivxIVX]+$", text):
+            continue
+        if re.match(r"^(page|p\.)\s*\d+$", text, re.IGNORECASE):
+            continue
+        kept_lines.append(
+            {
+                "text": text,
+                "x0": line.get("x0", 0.0),
+                "y0": line.get("y0", 0.0),
+                "x1": line.get("x1", 0.0),
+                "y1": line.get("y1", 0.0),
+            }
+        )
+    return kept_lines
+
+
 def _extract_texts_rapidocr_batch(
     pdf_path: str,
     page_numbers: list[int],
     headers_footers: frozenset[str],
-) -> dict[int, str]:
-    """Primary RapidOCR text path: one PDF pass per batch (digital pages use direct text)."""
+) -> dict[int, dict[str, Any]]:
+    """Primary RapidOCR text path (one PDF pass per batch; digital pages use
+    direct text, unchanged from before). Also captures per-line bboxes
+    (digital pages via PyMuPDF, scanned pages via RapidOCR's own detection
+    boxes) as positional metadata, kept separate from the canonical text so
+    heading detection input is byte-for-byte unchanged. Returns per-page
+    {"text": str, "line_boxes": [{"text","x0","y0","x1","y1"}]}.
+    """
     if not page_numbers:
         return {}
 
-    extractor = _get_rapidocr_pdf()
-    page_idx_list = [page_num - 1 for page_num in page_numbers]
+    rapidocr_pdf = _get_rapidocr_pdf()
+    dpi = int(getattr(rapidocr_pdf, "dpi", rapidocr_dpi()))
     force_ocr = rapidocr_force_all_pages()
 
-    with _RAPIDOCR_LOCK:
-        ocr_started = time.perf_counter()
-        rows = extractor(
-            pdf_path,
-            force_ocr=force_ocr,
-            page_num_list=page_idx_list,
-        )
-        _add_debug_timing("rapidocr_batch_text", time.perf_counter() - ocr_started)
+    ocr_started = time.perf_counter()
+    results: dict[int, dict[str, Any]] = {}
+    doc = fitz.open(pdf_path)
+    try:
+        for page_num in page_numbers:
+            page_obj = doc[page_num - 1]
 
-    texts: dict[int, str] = {}
-    for row in rows or []:
-        page_idx = int(row[0])
-        raw = str(row[1] or "")
-        texts[page_idx + 1] = _clean_page_text(raw, headers_footers)
+            if not force_ocr:
+                quick_check = page_obj.get_text("text", sort=True)
+            else:
+                quick_check = ""
+
+            if quick_check and quick_check.strip():
+                # Digital page: canonical text stays exactly as before
+                # (get_text("text", sort=True)); line boxes come from a
+                # separate get_text("dict") pass, used only for heading_y
+                # position lookups (content-matched, not offset-matched).
+                text = _clean_page_text(quick_check, headers_footers)
+                raw_lines = _digital_page_lines(page_obj) or []
+            else:
+                ocr_lines = _ocr_page_lines(rapidocr_pdf, page_obj, dpi)
+                text = _clean_page_text(
+                    "\n".join(line["text"] for line in ocr_lines), headers_footers
+                )
+                raw_lines = ocr_lines
+
+            line_boxes = _filter_lines(raw_lines, headers_footers)
+            results[page_num] = {"text": text, "line_boxes": line_boxes}
+    finally:
+        doc.close()
+    _add_debug_timing("rapidocr_batch_text", time.perf_counter() - ocr_started)
 
     for page_num in page_numbers:
-        texts.setdefault(page_num, "")
+        results.setdefault(page_num, {"text": "", "line_boxes": []})
 
-    return texts
+    return results
 
 
 def _page_batches(page_numbers: list[int], batch_size: int) -> list[list[int]]:
@@ -644,9 +766,9 @@ def _extract_page_batch_standalone(
     if not page_numbers:
         return []
 
-    rapidocr_texts: dict[int, str] = {}
+    rapidocr_pages: dict[int, dict[str, Any]] = {}
     if use_rapidocr_text():
-        rapidocr_texts = _extract_texts_rapidocr_batch(
+        rapidocr_pages = _extract_texts_rapidocr_batch(
             pdf_path, page_numbers, headers_footers
         )
 
@@ -672,8 +794,11 @@ def _extract_page_batch_standalone(
             images = _extract_page_images(doc, page_obj, page_num, page_width, page_height)
             _add_debug_timing("images_extract_encode", time.perf_counter() - images_started)
 
+            line_boxes: list[dict[str, Any]] = []
             if use_rapidocr_text():
-                text = rapidocr_texts.get(page_num, "")
+                page_rapidocr = rapidocr_pages.get(page_num) or {"text": "", "line_boxes": []}
+                text = page_rapidocr["text"]
+                line_boxes = page_rapidocr["line_boxes"]
             elif pdfplumber_doc is not None:
                 try:
                     text_started = time.perf_counter()
@@ -700,6 +825,7 @@ def _extract_page_batch_standalone(
                     "text": text,
                     "text_length": len(text),
                     "images": images,
+                    "line_boxes": line_boxes,
                 }
             )
     finally:
