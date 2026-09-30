@@ -1,0 +1,743 @@
+{
+  "device": "cpu",
+  "conf": 0.2,
+  "imgsz": 1024,
+  "pages": {
+    "6": {
+      "path": "C:\\Users\\eakes\\Documents\\chapterwise\\backend\\test_output\\doclayout_exp\\page_6_200dpi.png",
+      "elapsed_s": 4.53,
+      "names": {
+        "0": "title",
+        "1": "plain text",
+        "2": "abandon",
+        "3": "figure",
+        "4": "figure_caption",
+        "5": "table",
+        "6": "table_caption",
+        "7": "table_footnote",
+        "8": "isolate_formula",
+        "9": "formula_caption"
+      },
+      "n": 21,
+      "annotated": "C:\\Users\\eakes\\Documents\\chapterwise\\backend\\test_output\\doclayout_exp\\page_6_200dpi_annotated.jpg",
+      "orig_wh": [
+        1600,
+        2180
+      ],
+      "headings": [
+        {
+          "text": "1.4.1 EFFECT OF CHANGE OF TEMPERATURE",
+          "pdf_y0": 66.4,
+          "x1": 805.3,
+          "y1": 184.3,
+          "x2": 1433.4,
+          "y2": 231.8,
+          "cx": 1119.4,
+          "cy": 208.1
+        },
+        {
+          "text": "1.4 Can Matter Change its State?",
+          "pdf_y0": 518.4,
+          "x1": 126.7,
+          "y1": 1440.1,
+          "x2": 750.0,
+          "y2": 1494.3,
+          "cx": 438.3,
+          "cy": 1467.2
+        }
+      ],
+      "class_counts": {
+        "plain text": 10,
+        "title": 5,
+        "figure_caption": 1,
+        "figure": 1,
+        "abandon": 4
+      },
+      "dets": [
+        {
+          "i": 0,
+          "cls": "plain text",
+          "cls_id": 1,
+          "conf": 0.971,
+          "x1": 125.2,
+          "y1": 1697.8,
+          "x2": 760.6,
+          "y2": 1921.5,
+          "cx": 442.9,
+          "cy": 1809.6,
+          "area": 142143.0
+        },
+        {
+          "i": 1,
+          "cls": "plain text",
+          "cls_id": 1,
+          "conf": 0.947,
+          "x1": 124.6,
+          "y1": 1517.3,
+          "x2": 757.3,
+          "y2": 1589.4,
+          "cx": 440.9,
+          "cy": 1553.3,
+          "area": 45595.0
+        },
+        {
+          "i": 2,
+          "cls": "plain text",
+          "cls_id": 1,
+          "conf": 0.937,
+          "x1": 162.8,
+          "y1": 1594.2,
+          "x2": 655.9,
+          "y2": 1694.4,
+          "cx": 409.3,
+          "cy": 1644.3,
+          "area": 49399.0
+        },
+        {
+          "i": 3,
+          "cls": "title",
+          "cls_id": 0,
+          "conf": 0.934,
+          "x1": 126.4,
+          "y1": 1443.4,
+          "x2": 752.7,
+          "y2": 1493.9,
+          "cx": 439.6,
+          "cy": 1468.6,
+          "area": 31579.0
+        },
+        {
+          "i": 4,
+          "cls": "figure_caption",
+          "cls_id": 4,
+          "conf": 0.926,
+          "x1": 803.9,
+          "y1": 1855.1,
+          "x2": 1440.1,
+          "y2": 1917.8,
+          "cx": 1122.0,
+          "cy": 1886.4,
+          "area": 39880.0
+        },
+        {
+          "i": 5,
+          "cls": "plain text",
+          "cls_id": 1,
+          "conf": 0.918,
+          "x1": 866.5,
+          "y1": 333.0,
+          "x2": 1401.0,
+          "y2": 466.0,
+          "cx": 1133.7,
+          "cy": 399.5,
+          "area": 71067.0
+        },
+        {
+          "i": 6,
+          "cls": "figure",
+          "cls_id": 3,
+          "conf": 0.901,
+          "x1": 840.7,
+          "y1": 533.5,
+          "x2": 1404.5,
+          "y2": 1797.3,
+          "cx": 1122.6,
+          "cy": 1165.4,
+          "area": 712527.0
+        },
+        {
+          "i": 7,
+          "cls": "abandon",
+          "cls_id": 2,
+          "conf": 0.873,
+          "x1": 1355.6,
+          "y1": 1968.9,
+          "x2": 1439.1,
+          "y2": 1993.8,
+          "cx": 1397.3,
+          "cy": 1981.4,
+          "area": 2078.0
+        },
+        {
+          "i": 8,
+          "cls": "title",
+          "cls_id": 0,
+          "conf": 0.836,
+          "x1": 203.5,
+          "y1": 192.7,
+          "x2": 374.8,
+          "y2": 237.6,
+          "cx": 289.1,
+          "cy": 215.2,
+          "area": 7678.0
+        },
+        {
+          "i": 9,
+          "cls": "plain text",
+          "cls_id": 1,
+          "conf": 0.752,
+          "x1": 235.8,
+          "y1": 256.3,
+          "x2": 744.9,
+          "y2": 518.4,
+          "cx": 490.3,
+          "cy": 387.3,
+          "area": 133456.0
+        },
+        {
+          "i": 10,
+          "cls": "plain text",
+          "cls_id": 1,
+          "conf": 0.742,
+          "x1": 233.8,
+          "y1": 830.7,
+          "x2": 472.8,
+          "y2": 860.7,
+          "cx": 353.3,
+          "cy": 845.7,
+          "area": 7161.0
+        },
+        {
+          "i": 11,
+          "cls": "abandon",
+          "cls_id": 2,
+          "conf": 0.612,
+          "x1": 804.9,
+          "y1": 190.9,
+          "x2": 1437.6,
+          "y2": 229.3,
+          "cx": 1121.3,
+          "cy": 210.1,
+          "area": 24240.0
+        },
+        {
+          "i": 12,
+          "cls": "plain text",
+          "cls_id": 1,
+          "conf": 0.608,
+          "x1": 226.9,
+          "y1": 524.1,
+          "x2": 743.8,
+          "y2": 824.6,
+          "cx": 485.4,
+          "cy": 674.3,
+          "area": 155340.0
+        },
+        {
+          "i": 13,
+          "cls": "title",
+          "cls_id": 0,
+          "conf": 0.608,
+          "x1": 835.8,
+          "y1": 266.7,
+          "x2": 987.1,
+          "y2": 313.0,
+          "cx": 911.4,
+          "cy": 289.9,
+          "area": 7004.0
+        },
+        {
+          "i": 14,
+          "cls": "plain text",
+          "cls_id": 1,
+          "conf": 0.567,
+          "x1": 234.6,
+          "y1": 1247.5,
+          "x2": 744.8,
+          "y2": 1395.9,
+          "cx": 489.7,
+          "cy": 1321.7,
+          "area": 75685.0
+        },
+        {
+          "i": 15,
+          "cls": "plain text",
+          "cls_id": 1,
+          "conf": 0.534,
+          "x1": 279.2,
+          "y1": 866.4,
+          "x2": 745.7,
+          "y2": 1240.3,
+          "cx": 512.4,
+          "cy": 1053.4,
+          "area": 174412.0
+        },
+        {
+          "i": 16,
+          "cls": "abandon",
+          "cls_id": 2,
+          "conf": 0.414,
+          "x1": 717.9,
+          "y1": 2118.9,
+          "x2": 883.2,
+          "y2": 2146.0,
+          "cx": 800.6,
+          "cy": 2132.5,
+          "area": 4489.0
+        },
+        {
+          "i": 17,
+          "cls": "plain text",
+          "cls_id": 1,
+          "conf": 0.367,
+          "x1": 225.3,
+          "y1": 254.2,
+          "x2": 746.9,
+          "y2": 1398.2,
+          "cx": 486.1,
+          "cy": 826.2,
+          "area": 596722.0
+        },
+        {
+          "i": 18,
+          "cls": "abandon",
+          "cls_id": 2,
+          "conf": 0.335,
+          "x1": 127.0,
+          "y1": 191.9,
+          "x2": 194.4,
+          "y2": 486.2,
+          "cx": 160.7,
+          "cy": 339.1,
+          "area": 19841.0
+        },
+        {
+          "i": 19,
+          "cls": "title",
+          "cls_id": 0,
+          "conf": 0.293,
+          "x1": 804.9,
+          "y1": 190.9,
+          "x2": 1437.6,
+          "y2": 229.3,
+          "cx": 1121.3,
+          "cy": 210.1,
+          "area": 24240.0
+        },
+        {
+          "i": 20,
+          "cls": "title",
+          "cls_id": 0,
+          "conf": 0.278,
+          "x1": 832.0,
+          "y1": 265.0,
+          "x2": 1393.5,
+          "y2": 313.8,
+          "cx": 1112.8,
+          "cy": 289.4,
+          "area": 27385.0
+        }
+      ]
+    },
+    "68": {
+      "path": "C:\\Users\\eakes\\Documents\\chapterwise\\backend\\test_output\\doclayout_exp\\page_68_200dpi.png",
+      "elapsed_s": 1.82,
+      "names": {
+        "0": "title",
+        "1": "plain text",
+        "2": "abandon",
+        "3": "figure",
+        "4": "figure_caption",
+        "5": "table",
+        "6": "table_caption",
+        "7": "table_footnote",
+        "8": "isolate_formula",
+        "9": "formula_caption"
+      },
+      "n": 7,
+      "annotated": "C:\\Users\\eakes\\Documents\\chapterwise\\backend\\test_output\\doclayout_exp\\page_68_200dpi_annotated.jpg",
+      "orig_wh": [
+        1700,
+        2200
+      ],
+      "class_counts": {
+        "table": 1,
+        "figure": 2,
+        "plain text": 3,
+        "title": 1
+      },
+      "dets": [
+        {
+          "i": 0,
+          "cls": "table",
+          "cls_id": 5,
+          "conf": 0.95,
+          "x1": 134.1,
+          "y1": 1433.4,
+          "x2": 1470.2,
+          "y2": 1703.8,
+          "cx": 802.1,
+          "cy": 1568.6,
+          "area": 361212.0
+        },
+        {
+          "i": 1,
+          "cls": "figure",
+          "cls_id": 3,
+          "conf": 0.941,
+          "x1": 298.5,
+          "y1": 1105.0,
+          "x2": 1404.6,
+          "y2": 1395.5,
+          "cx": 851.6,
+          "cy": 1250.3,
+          "area": 321293.0
+        },
+        {
+          "i": 2,
+          "cls": "figure",
+          "cls_id": 3,
+          "conf": 0.906,
+          "x1": 186.9,
+          "y1": 73.5,
+          "x2": 1486.4,
+          "y2": 689.7,
+          "cx": 836.6,
+          "cy": 381.6,
+          "area": 800744.0
+        },
+        {
+          "i": 3,
+          "cls": "plain text",
+          "cls_id": 1,
+          "conf": 0.78,
+          "x1": 194.4,
+          "y1": 738.1,
+          "x2": 1455.1,
+          "y2": 1074.4,
+          "cx": 824.8,
+          "cy": 906.2,
+          "area": 423897.0
+        },
+        {
+          "i": 4,
+          "cls": "plain text",
+          "cls_id": 1,
+          "conf": 0.512,
+          "x1": 197.9,
+          "y1": 738.3,
+          "x2": 1448.3,
+          "y2": 813.9,
+          "cx": 823.1,
+          "cy": 776.1,
+          "area": 94518.0
+        },
+        {
+          "i": 5,
+          "cls": "plain text",
+          "cls_id": 1,
+          "conf": 0.51,
+          "x1": 197.4,
+          "y1": 693.1,
+          "x2": 472.3,
+          "y2": 729.1,
+          "cx": 334.8,
+          "cy": 711.1,
+          "area": 9892.0
+        },
+        {
+          "i": 6,
+          "cls": "title",
+          "cls_id": 0,
+          "conf": 0.482,
+          "x1": 197.4,
+          "y1": 693.1,
+          "x2": 472.3,
+          "y2": 729.1,
+          "cx": 334.8,
+          "cy": 711.1,
+          "area": 9892.0
+        }
+      ]
+    },
+    "684": {
+      "path": "C:\\Users\\eakes\\Documents\\chapterwise\\backend\\test_output\\doclayout_exp\\page_684_200dpi.png",
+      "elapsed_s": 1.38,
+      "names": {
+        "0": "title",
+        "1": "plain text",
+        "2": "abandon",
+        "3": "figure",
+        "4": "figure_caption",
+        "5": "table",
+        "6": "table_caption",
+        "7": "table_footnote",
+        "8": "isolate_formula",
+        "9": "formula_caption"
+      },
+      "n": 14,
+      "annotated": "C:\\Users\\eakes\\Documents\\chapterwise\\backend\\test_output\\doclayout_exp\\page_684_200dpi_annotated.jpg",
+      "orig_wh": [
+        1600,
+        2180
+      ],
+      "class_counts": {
+        "plain text": 7,
+        "title": 2,
+        "figure": 1,
+        "figure_caption": 1,
+        "abandon": 3
+      },
+      "dets": [
+        {
+          "i": 0,
+          "cls": "plain text",
+          "cls_id": 1,
+          "conf": 0.983,
+          "x1": 844.4,
+          "y1": 438.2,
+          "x2": 1478.3,
+          "y2": 896.2,
+          "cx": 1161.3,
+          "cy": 667.2,
+          "area": 290355.0
+        },
+        {
+          "i": 1,
+          "cls": "plain text",
+          "cls_id": 1,
+          "conf": 0.983,
+          "x1": 164.4,
+          "y1": 1603.3,
+          "x2": 799.0,
+          "y2": 1922.6,
+          "cx": 481.7,
+          "cy": 1762.9,
+          "area": 202626.0
+        },
+        {
+          "i": 2,
+          "cls": "plain text",
+          "cls_id": 1,
+          "conf": 0.982,
+          "x1": 843.8,
+          "y1": 1103.2,
+          "x2": 1478.6,
+          "y2": 1710.5,
+          "cx": 1161.2,
+          "cy": 1406.8,
+          "area": 385483.0
+        },
+        {
+          "i": 3,
+          "cls": "plain text",
+          "cls_id": 1,
+          "conf": 0.98,
+          "x1": 844.1,
+          "y1": 187.1,
+          "x2": 1477.0,
+          "y2": 434.7,
+          "cx": 1160.6,
+          "cy": 310.9,
+          "area": 156703.0
+        },
+        {
+          "i": 4,
+          "cls": "plain text",
+          "cls_id": 1,
+          "conf": 0.976,
+          "x1": 843.8,
+          "y1": 1713.8,
+          "x2": 1476.9,
+          "y2": 1922.3,
+          "cx": 1160.3,
+          "cy": 1818.0,
+          "area": 131975.0
+        },
+        {
+          "i": 5,
+          "cls": "plain text",
+          "cls_id": 1,
+          "conf": 0.941,
+          "x1": 890.7,
+          "y1": 900.4,
+          "x2": 1383.2,
+          "y2": 1006.1,
+          "cx": 1137.0,
+          "cy": 953.2,
+          "area": 52092.0
+        },
+        {
+          "i": 6,
+          "cls": "title",
+          "cls_id": 0,
+          "conf": 0.918,
+          "x1": 846.7,
+          "y1": 1042.9,
+          "x2": 1403.9,
+          "y2": 1080.3,
+          "cx": 1125.3,
+          "cy": 1061.6,
+          "area": 20843.0
+        },
+        {
+          "i": 7,
+          "cls": "figure",
+          "cls_id": 3,
+          "conf": 0.915,
+          "x1": 186.5,
+          "y1": 192.1,
+          "x2": 779.9,
+          "y2": 1243.6,
+          "cx": 483.2,
+          "cy": 717.8,
+          "area": 624011.0
+        },
+        {
+          "i": 8,
+          "cls": "plain text",
+          "cls_id": 1,
+          "conf": 0.911,
+          "x1": 274.4,
+          "y1": 1434.0,
+          "x2": 776.8,
+          "y2": 1504.2,
+          "cx": 525.6,
+          "cy": 1469.1,
+          "area": 35281.0
+        },
+        {
+          "i": 9,
+          "cls": "figure_caption",
+          "cls_id": 4,
+          "conf": 0.89,
+          "x1": 296.0,
+          "y1": 1288.4,
+          "x2": 720.5,
+          "y2": 1320.7,
+          "cx": 508.2,
+          "cy": 1304.5,
+          "area": 13718.0
+        },
+        {
+          "i": 10,
+          "cls": "abandon",
+          "cls_id": 2,
+          "conf": 0.887,
+          "x1": 167.3,
+          "y1": 1969.9,
+          "x2": 500.5,
+          "y2": 1993.6,
+          "cx": 333.9,
+          "cy": 1981.7,
+          "area": 7914.0
+        },
+        {
+          "i": 11,
+          "cls": "abandon",
+          "cls_id": 2,
+          "conf": 0.659,
+          "x1": 718.3,
+          "y1": 2119.7,
+          "x2": 882.5,
+          "y2": 2145.5,
+          "cx": 800.4,
+          "cy": 2132.6,
+          "area": 4228.0
+        },
+        {
+          "i": 12,
+          "cls": "title",
+          "cls_id": 0,
+          "conf": 0.528,
+          "x1": 170.9,
+          "y1": 1366.6,
+          "x2": 375.4,
+          "y2": 1418.4,
+          "cx": 273.1,
+          "cy": 1392.5,
+          "area": 10577.0
+        },
+        {
+          "i": 13,
+          "cls": "abandon",
+          "cls_id": 2,
+          "conf": 0.277,
+          "x1": 1372.8,
+          "y1": 1965.9,
+          "x2": 1475.4,
+          "y2": 2178.7,
+          "cx": 1424.1,
+          "cy": 2072.3,
+          "area": 21840.0
+        }
+      ]
+    }
+  },
+  "crops": {
+    "xylem_p68": {
+      "path": "C:\\Users\\eakes\\Documents\\chapterwise\\backend\\test_output\\p68_xref593.png",
+      "elapsed_s": 1.25,
+      "names": {
+        "0": "title",
+        "1": "plain text",
+        "2": "abandon",
+        "3": "figure",
+        "4": "figure_caption",
+        "5": "table",
+        "6": "table_caption",
+        "7": "table_footnote",
+        "8": "isolate_formula",
+        "9": "formula_caption"
+      },
+      "n": 1,
+      "dets": [
+        {
+          "i": 0,
+          "cls": "figure",
+          "cls_id": 3,
+          "conf": 0.408,
+          "x1": 9.7,
+          "y1": 37.5,
+          "x2": 210.0,
+          "y2": 340.0,
+          "cx": 109.9,
+          "cy": 188.7,
+          "area": 60593.0
+        }
+      ],
+      "annotated": "C:\\Users\\eakes\\Documents\\chapterwise\\backend\\test_output\\doclayout_exp\\p68_xref593_annotated.jpg",
+      "orig_wh": [
+        212,
+        340
+      ]
+    },
+    "wheat_p684": {
+      "path": "C:\\Users\\eakes\\Documents\\chapterwise\\backend\\test_output\\p684_i0_source.png",
+      "elapsed_s": 1.44,
+      "names": {
+        "0": "title",
+        "1": "plain text",
+        "2": "abandon",
+        "3": "figure",
+        "4": "figure_caption",
+        "5": "table",
+        "6": "table_caption",
+        "7": "table_footnote",
+        "8": "isolate_formula",
+        "9": "formula_caption"
+      },
+      "n": 1,
+      "dets": [
+        {
+          "i": 0,
+          "cls": "figure",
+          "cls_id": 3,
+          "conf": 0.743,
+          "x1": 11.3,
+          "y1": 114.7,
+          "x2": 765.4,
+          "y2": 1041.2,
+          "cx": 388.3,
+          "cy": 577.9,
+          "area": 698677.0
+        }
+      ],
+      "annotated": "C:\\Users\\eakes\\Documents\\chapterwise\\backend\\test_output\\doclayout_exp\\p684_i0_source_annotated.jpg",
+      "orig_wh": [
+        800,
+        1042
+      ]
+    }
+  }
+}

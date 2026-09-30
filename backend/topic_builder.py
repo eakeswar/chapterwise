@@ -34,10 +34,11 @@ _SUBSECTION_RE = re.compile(
 _SECTION_RE = re.compile(
     r"(?<![\d.])(?P<num>\d+\.\d+)(?!\.\d)\s+(?P<title>[A-Z][A-Za-z0-9][A-Za-z0-9 ?'\-]{1,50})"
 )
-# Chapter 1 / OCR "hapterC 1"
+# Chapter 1 / OCR "hapterC 1" — line-start only so mid-sentence
+# refs ("see Chapter 7", "of ions in Chapter 4") are not headings.
 _CHAPTER_RE = re.compile(
-    r"(?:Chapter|hapterC)\s*(?P<num>\d+)\b",
-    re.IGNORECASE,
+    r"^[ \t]*(?:Chapter|hapterC)\s*(?P<num>\d+)\b",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 _SECTION_TITLE_BLOCKLIST = re.compile(
